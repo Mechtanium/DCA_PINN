@@ -1,7 +1,7 @@
 """
-Add workflow module for per_datasets
+PINN Workflow Module
 """
 
-from .workflow import add
+from .workflow import train
 
-__all__ = ['add']
+__all__ = ['train']

@@ -1,158 +1,61 @@
 # Workflow Template - Create Your Own Custom Workflows
 
-A template repository for creating and managing custom workflow functions in Python. This template provides the structure and documentation standards for building reusable workflow components.
+Decline Curve Analysis (DCA) is one of the primary ways to estimate expected pressure declines and total recovery in pressurized porous fluid diffusion systems.
 
-## 1. How to Fork This Template
+In this workflow a Physics Informed Neural Network with a Transformer-based core architecture is used to learn from DCA models in an automatic self-attention driven way how to predict DCA decline. The network learns how to predict DCA accurately by automatically deciding which DCA models to apply at which stage and in which systems.
 
-### Create Your Own Workflow Repository
-1. **Click the "Use this template" button** on GitHub
-2. **Create a new repository** with your desired name (e.g., "my-custom-workflows")
-3. **Clone your new repository:**
-```bash
-git clone https://github.com/P-E-R-D/server.git
-cd server
-```
-
-## 2. How to Set Up Your Custom Workflow
-
-### Prerequisites
+## Prerequisites
 - Python 3.7+
 - pip package manager
 
-### Initial Setup
-1. **Rename the package** (optional but recommended):
-   - Change all occurrences of "per_datasets" to your package name
-   - Update folder structure accordingly
-
-2. **Install base dependencies:**
+**Install base dependencies:**
 ```bash
-cd workflows/add
-pip install -r requirements.txt
+pip install --quiet torch
+pip install --quiet per_datasets
 ```
 
-3. **Install your package in development mode:**
-```bash
-pip install -e .
-```
-
-## 3. How to Test Your Workflow
-
-### Test the Example Function
+## Using the workflow
 ```python
-from src.workflows.add.workflow import add
+import torch
+import per_datasets
 
-# Test the included example 
-result = add(2.5, 3.7)
-print(f"Result: {result}")  # Should print: 6.2
-```
+seq_len = 1000
+batch_size = 4
+input_dim = 1
+D = 2e-2
 
-### Create Your Own Tests
-Create a `test.py` file:
-```python
-# test.py file
-from src.workflows.add.workflow import add
+# ---------------
+# Data generation
+# ---------------
 
-# Test the included example 
-result = add(2.5, 3.7)
-print(f"Result: {result}")  # Should print: 6.2
-```
+# t_dummy: Represents input sequence (e.g., time steps)
+# For PINNs, inputs for derivative calculations must have requires_grad=True.
+# Create monotonic increasing time sequences per batch from 0 to 1 with random steps.
+# First value is always zero; values increase in random steps and the final value is 1.
+zeros = torch.zeros(1, batch_size, input_dim) + 1e-4
+increments = torch.rand(seq_len - 1, batch_size, input_dim)
+cumsum = torch.cat([zeros, increments.cumsum(dim=0)], dim=0)
+# Normalize each sequence so its last element equals 1 (avoid division by zero)
+last = cumsum[-1:].clone()
+last[last == 0] = 1.0
+t_dummy = (cumsum / last)
+# Enable gradient tracking for PINN derivative calculations
+t_dummy.requires_grad_()
 
-Run with:
-```bash
-python -m src.workflows.add.test
-```
+qi_args = (torch.rand(batch_size, 1) * 1000) + 2500  # Random qi between 2500 and 3500
 
-## 4. How to Modify and Create Your Own Workflows
+# Compute true q using qi_args per batch and the analytic decay q = qi * exp(-D * t)
+# qi_args has shape (batch_size, 1); expand to (1, batch_size, 1) to broadcast over seq_len
+q_true_dummy = (qi_args.unsqueeze(0) * torch.exp(-D * t_dummy.detach())) + (torch.rand(seq_len, batch_size, input_dim) * 5)  # Adding small noise
 
-### Step 1: Create a New Workflow Folder
-```bash
-# Create a new workflow directory
-mkdir workflows/my_custom_workflow
-cd workflows/my_custom_workflow
-```
+# --------------
+# DCA_PINN usage
+# --------------
 
-### Step 2: Create Your Workflow Files
-**Create `workflow.py`:**
-```python
-"""
-Your custom workflow function
-"""
+with per_datasets.initialize(workflows=['DCA_PINN_Workflow_ID/from/perd-website'], DISK=250, RAM=24, vCPU=8) as pds: # DISK && RAM are in GB
+    results = pds.workflows.DCA_PINN.train(t_dummy, q_true_dummy, epochs=50, learning_rate = 1, live_mode=True)
+    print(f"Final Loss: {results['final_loss']}")
 
-def my_custom_workflow(input_data: dict) -> dict:
-    """
-    ## my_custom_workflow
-    
-    Describe what your workflow does here.
-    
-    ### **parameters**
-    
-    input_data : dict
-        Input data description
-        
-    ### **returns**
-    
-    dict
-        Processed output data
-        
-    ### **examples**
-    
-    >>> from your_package.workflows.my_custom_workflow import my_custom_workflow
-    >>> result = my_custom_workflow({"input": "data"})
-    >>> print(result)
-    {'processed': 'result'}
-    """
-    # Your workflow logic here
-    processed_data = {"processed": input_data.get("input", "") + "_processed"}
-    return processed_data
-```
-
-**Create `__init__.py`:**
-```python
-"""
-My custom workflow module
-"""
-
-from .workflow import my_custom_workflow
-
-__all__ = ['my_custom_workflow']
-```
-
-**Create `requirements.txt`** (if your workflow needs specific packages):
-```
-pandas>=1.3.0
-numpy>=1.21.0
-requests>=2.25.0
-```
-
-### Step 3: Update Package Exports
-Edit the main `workflows/__init__.py`:
-```python
-"""
-Workflows module for your_package_name
-"""
-
-from .add import add
-from .substract import subtract
-from .my_custom_workflow import my_custom_workflow  # Add your new workflow
-
-__all__ = ['add', 'subtract', 'my_custom_workflow']  # Update this list
-```
-
-## 5. How to Upload and Distribute Your Workflow
-
-
-## Workflow Structure Template
-```
-
-├── workflows/
-│   ├── __init__.py                 # Main exports
-│   ├── add/                        # Example workflow
-│   │   ├── __init__.py
-│   │   ├── workflow.py
-│   │   └── requirements.txt
-│   └── my_custom_workflow/         # Your custom workflow
-│       ├── __init__.py
-│       ├── workflow.py
-│       └── requirements.txt             
-└── README.md                      
+    # Or use pds.visual if imported as pds
+    pds.visual.line_plot(results, y='loss_history', title="PINN Training Loss")
 ```
