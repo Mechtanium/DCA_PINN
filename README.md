@@ -78,8 +78,43 @@ curl -X POST http://localhost:5000/train \
     -d '{"X": [[[0.0]]], "Y": [[[1.0]]], "epochs": 10}'
 ```
 
-Notes:
-- The server expects `X` shaped `[seq_len, batch_size, input_dim]` and `Y` shaped `[seq_len, batch_size, 1]`.
-- `X` will be converted to a `torch.Tensor` with `requires_grad=True` to allow derivative computation inside the PINN.
-- Training runs synchronously in this simple server; for production or long runs, run asynchronously (e.g., background worker).
+├── workflows/
+│   ├── __init__.py                 # Main exports
+│   ├── add/                        # Example workflow
+│   │   ├── __init__.py
+│   │   ├── workflow.py
+│   │   └── requirements.txt
+│   └── my_custom_workflow/         # Your custom workflow
+│       ├── __init__.py
+│       ├── workflow.py
+│       └── requirements.txt             
+└── README.md                      
+```
+
+## Running the Flask server
+
+Local development (dev server):
+
+```bash
+python main.py
+```
+
+Production (gunicorn):
+
+```bash
+gunicorn --bind 0.0.0.0:5000 main:app
+```
+
+Docker build and run:
+
+```bash
+docker build -t workflow-server .
+docker run -p 5000:5000 workflow-server
+```
+
+Example request:
+
+```bash
+curl -X POST -H "Content-Type: application/json" \
+    -d '{"a":2.5,"b":3.7}' http://localhost:5000/add
 ```
