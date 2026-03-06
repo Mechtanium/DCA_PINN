@@ -350,7 +350,9 @@ async def train(
     lambda_data = float(lambda_data)
     lambda_pde = float(lambda_pde)
 
-    data = [(float(x), float(q), float(Di), float(b), float(Dinf), float(n), float(T)) for x, q, Di, b, Dinf, n, T in inputStream]
+    data = []
+    async for x, q, Di, b, Dinf, n, T in inputStream:
+        data.append((float(x), float(q), float(Di), float(b), float(Dinf), float(n), float(T)))
 
     data_t = torch.tensor(data, dtype=torch.float32)  # (seq_len, 7)
     data_t = data_t.reshape(data_t.size(0) // batch_size, batch_size, 7)
