@@ -5,7 +5,6 @@ PINN Workflow
 import torch
 import torch.nn as nn
 import math
-from per_datasets import workflow
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model: int, max_len: int = 5000):
@@ -302,23 +301,26 @@ class PINNTransformer(nn.Module):
         # 3f. Return both predicted_y and adaptive_weights
         return predicted_y, adaptive_weights
 
+
+from per_datasets import workflow
+from per_datasets.workflow import WorkflowStreamInput, WorkflowStreamOutput
+
 @workflow.bi_di
-def train(
-    X,
-    Y,
+async def train(
+    inputStream: WorkflowStreamInput[float, float, float, float, float, float, float],
+    batch_size: int = 4,
     epochs: int = 100,
-    output_dim = 6,
-    num_pde_constraints = 5,
-    d_model = 64,
-    num_heads = 4,
-    dim_feedforward = 128,
-    num_layers = 2,
-    dropout = 0.1,
-    learning_rate = 0.001,
-    lambda_data = 1.0,
-    lambda_pde = 1.0,
-    live_mode=False
-) -> dict:
+    output_dim: int = 6,
+    num_pde_constraints: int = 5,
+    d_model: int = 64,
+    num_heads: int = 4,
+    dim_feedforward: int = 128,
+    num_layers: int = 2,
+    dropout: float = 0.1,
+    learning_rate: float = 0.001,
+    lambda_data: float = 1.0,
+    lambda_pde: float = 1.0
+) -> WorkflowStreamOutput[int, float]:
     """
     ## pinn
     
@@ -335,8 +337,29 @@ def train(
         Training results including final loss.
     """
 
+    batch_size = int(batch_size)
+    epochs = int(epochs[0])
+    output_dim = int(output_dim[0])
+    num_pde_constraints = int(num_pde_constraints[0])
+    d_model = int(d_model[0])
+    num_heads = int(num_heads[0])
+    dim_feedforward = int(dim_feedforward[0])
+    num_layers = int(num_layers[0])
+    dropout = float(dropout[0])
+    learning_rate = float(learning_rate[0])
+    lambda_data = float(lambda_data[0])
+    lambda_pde = float(lambda_pde)
+
+    data = [(float(x), float(q), float(Di), float(b), float(Dinf), float(n), float(T)) for x, q, Di, b, Dinf, n, T in inputStream]
+
+    data_t = torch.tensor(data, dtype=torch.float32)  # (seq_len, 7)
+    data_t = data_t.reshape(data_t.size(0) // batch_size, batch_size, 7)
+
+    input_dim = data_t.shape[-1] - output_dim  # Assuming last 6 columns are true_y (q, Di, b, Dinf, n, T)
+    X = data_t[:, :, :input_dim]
+    Y = data_t[:, :, input_dim:]
+
     pde_input_dummy = X
-    input_dim = X.shape[-1]
 
     # Model instantiation
     model = PINNTransformer(
@@ -350,7 +373,7 @@ def train(
         dropout=dropout
     )
 
-    pde_constraints_module = PDEConstraints(num_pde_constraints=num_pde_constraints)
+    pde_constraints_module = PDEConstraints(num_pde_constraints=int(num_pde_constraints))
     pinn_loss_fn = PINNLoss(lambda_data=lambda_data, lambda_pde=lambda_pde)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
@@ -378,14 +401,13 @@ def train(
         final_loss = total_loss.item()
         loss_history.append(final_loss)
         
-        if live_mode and ((epoch + 1) % 10 == 0 or epoch == 0):
+        if ((epoch + 1) % 10 == 0 or epoch == 0):
             # pending functionality to return live plotting data over websocket connection
             print(f"Epoch [{epoch+1}/{epochs}], Loss: {final_loss:.4f}")
-
-    print("Training loop finished.")
-    return {
-        "status": "success", 
-        "final_loss": final_loss, 
-        "epochs": epochs,
-        "loss_history": loss_history
-    }
+            yield {
+                "epoch": epoch + 1,
+                "loss": final_loss,
+                # "predicted_y": predicted_y.detach().cpu().numpy(),
+                # "adaptive_weights": adaptive_weights.detach().cpu().numpy(),
+                # "pde_residuals": pde_residuals.detach().cpu().numpy()
+            }
