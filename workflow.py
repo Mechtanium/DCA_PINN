@@ -407,8 +407,8 @@ async def train(
             # pending functionality to return live plotting data over websocket connection
             print(f"Epoch [{epoch+1}/{epochs}], Loss: {final_loss:.4f}")
             yield {
-                "epoch": epoch + 1,
-                "loss": final_loss,
+                "item_1": epoch + 1,
+                "item_2": final_loss,
                 # "predicted_y": predicted_y.detach().cpu().numpy(),
                 # "adaptive_weights": adaptive_weights.detach().cpu().numpy(),
                 # "pde_residuals": pde_residuals.detach().cpu().numpy()
