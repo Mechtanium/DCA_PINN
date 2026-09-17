@@ -64,6 +64,26 @@ asyncio.run(main())
 
 `Workstation.connect` finds the control plane on its own (or uses `PERD_API_URL` if you set one), resolves the workflow's contract, provisions a workstation running this image, and returns a handle whose methods are materialised from the contract — `help(ws.workflows.dca_pinn.train)` shows the parameters above.
 
+## The app page
+
+[`page.py`](page.py) gives the workflow a face. It is a **perdlit** page — the Streamlit-shaped UI library that ships inside `perd-worker` — and it runs on the workstation itself when the workflow is launched as an app from the PERD store (**Launch app** on the store entry). The page collects the data (a synthetic decline with sequence length, decline rate, noise and seed, or an uploaded CSV of `t, q, Di, b, Dinf, n, T` rows) and the training parameters, previews the rows, and puts `train` on a button:
+
+```python
+run = pl.button("Train", callable=train, args=[rows, batch_size, epochs], kwargs={"learning_rate": learning_rate, ...})
+pl.metric("Latest loss", run, field=1, fmt=".4f")
+pl.progress(run, total=epochs, field=0)
+pl.line_chart(run, x=0, y=1, labels=["epoch", "loss"])
+```
+
+Pressing **Train** runs `train` as a job on the workstation's orchestrator — the same durable path a Python caller takes — and every `(epoch, loss)` it yields streams into the metric, the progress bar and the chart for everyone looking at the page. The app lives at `https://perd.app/app/<slug>/`; who can open it (anyone with the link, signed-in users, or an invite list) and what they may do (view, run, or edit and run) is chosen at launch and can be changed afterwards.
+
+To check the page renders before publishing:
+
+```bash
+pip install -r requirements.txt 'perd-worker[page]'
+python -c "from perdlit._script import check_page; print(check_page('page', 'workflow'))"
+```
+
 ## Running the module locally
 
 ```bash
