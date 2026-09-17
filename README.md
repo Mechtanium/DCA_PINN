@@ -31,7 +31,7 @@ Sign in on the PERD website, open **Store → Publish from GitHub**, and paste t
 
 ```bash
 pip install perd
-export PERD_API_URL=https://api.perd.app PERD_API_KEY=pak_...
+export PERD_API_KEY=pak_...
 python -m perd workflow publish --git https://github.com/Mechtanium/DCA_PINN --name "DCA PINN"
 ```
 
@@ -44,7 +44,6 @@ import random
 
 from perd import Workstation
 
-API_URL = "https://api.perd.app"
 API_KEY = "pak_..."          # Store → API Keys on the website
 
 def samples(seq_len=200, batch_size=4, D=2e-2):
@@ -56,14 +55,14 @@ def samples(seq_len=200, batch_size=4, D=2e-2):
         yield (t, q, D, 0.5, 1e-3, 0.5, 1.0)
 
 async def main():
-    ws = await Workstation.connect(API_URL, api_key=API_KEY, workflows=["dca_pinn"])
+    ws = await Workstation.connect(api_key=API_KEY, workflows=["dca_pinn"])
     async for epoch, loss in ws.workflows.dca_pinn.train(samples(), epochs=50, learning_rate=0.001):
         print(f"epoch {epoch}: loss {loss:.4f}")
 
 asyncio.run(main())
 ```
 
-`Workstation.connect` resolves the workflow's contract, provisions a workstation running this image, and returns a handle whose methods are materialised from the contract — `help(ws.workflows.dca_pinn.train)` shows the parameters above.
+`Workstation.connect` finds the control plane on its own (or uses `PERD_API_URL` if you set one), resolves the workflow's contract, provisions a workstation running this image, and returns a handle whose methods are materialised from the contract — `help(ws.workflows.dca_pinn.train)` shows the parameters above.
 
 ## Running the module locally
 
