@@ -1,10 +1,16 @@
+"""DCA_PINN: a Physics-Informed Transformer for decline-curve analysis, as a
+PERD workflow.
+
+The module-level ``workflow`` registry (from ``perd_worker``) is what PERD
+serves: publish this repository on the website (or with ``python -m perd
+workflow publish --git <this repo>``), start a workstation on it, and call
+``ws.workflows.dca_pinn.train(...)`` from the ``perd`` library.
 """
-PINN Workflow
-"""
+
+import math
 
 import torch
 import torch.nn as nn
-import math
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model: int, max_len: int = 5000):
@@ -302,8 +308,8 @@ class PINNTransformer(nn.Module):
         return predicted_y, adaptive_weights
 
 
-from per_datasets import workflow
-from per_datasets.workflow import WorkflowStreamInput, WorkflowStreamOutput
+from perd_worker import workflow, WorkflowStreamInput, WorkflowStreamOutput
+
 
 @workflow.bi_di
 async def train(
@@ -319,22 +325,30 @@ async def train(
     dropout: float = 0.1,
     learning_rate: float = 0.001,
     lambda_data: float = 1.0,
-    lambda_pde: float = 1.0
+    lambda_pde: float = 1.0,
+    report_every: int = 10,
 ) -> WorkflowStreamOutput[int, float]:
-    """
-    ## pinn
-    
-    Runs a Physics-Informed Neural Network (PINN) Transformer training workflow.
-    
-    ### **parameters**
-    
+    """Train the PINN Transformer on a stream of decline-curve samples.
+
+    Stream in one item per time step: ``(t, q, Di, b, Dinf, n, T)`` — the
+    time and the six targets (rate plus the five DCA parameters). Items are
+    consumed in order and folded into sequences of ``batch_size`` rows.
+
+    Streams out ``(epoch, loss)`` on the first epoch and every
+    ``report_every`` epochs after that, so a client can plot the loss live.
+
+    Parameters
+    ----------
+    batch_size : int
+        Sequences per optimisation step (default 4).
     epochs : int
-        Number of training epochs (default: 100)
-        
-    ### **returns**
-    
-    dict
-        Training results including final loss.
+        Number of training epochs (default 100).
+    learning_rate : float
+        Adam step size (default 0.001).
+    lambda_data, lambda_pde : float
+        Weights of the data-fit and physics-residual loss terms.
+    report_every : int
+        Emit ``(epoch, loss)`` every this many epochs (default 10).
     """
 
     batch_size = int(batch_size)
@@ -354,8 +368,18 @@ async def train(
     async for x, q, Di, b, Dinf, n, T in inputStream:
         data.append((float(x), float(q), float(Di), float(b), float(Dinf), float(n), float(T)))
 
+    if not data:
+        raise ValueError("train needs at least one (t, q, Di, b, Dinf, n, T) item")
     data_t = torch.tensor(data, dtype=torch.float32)  # (seq_len, 7)
-    data_t = data_t.reshape(data_t.size(0) // batch_size, batch_size, 7)
+    # Fold rows into (seq_len // batch_size, batch_size, 7); trailing rows
+    # that do not fill a batch are dropped rather than crashing the reshape.
+    usable = (data_t.size(0) // batch_size) * batch_size
+    if usable == 0:
+        raise ValueError(
+            f"train received {data_t.size(0)} item(s) but batch_size={batch_size}; "
+            "stream at least batch_size items"
+        )
+    data_t = data_t[:usable].reshape(usable // batch_size, batch_size, 7)
 
     input_dim = data_t.shape[-1] - output_dim  # Assuming last 6 columns are true_y (q, Di, b, Dinf, n, T)
     X = data_t[:, :, :input_dim]
@@ -403,13 +427,6 @@ async def train(
         final_loss = total_loss.item()
         loss_history.append(final_loss)
         
-        if ((epoch + 1) % 10 == 0 or epoch == 0):
-            # pending functionality to return live plotting data over websocket connection
+        if (epoch + 1) % max(int(report_every), 1) == 0 or epoch == 0:
             print(f"Epoch [{epoch+1}/{epochs}], Loss: {final_loss:.4f}")
-            yield {
-                "item_1": epoch + 1,
-                "item_2": final_loss,
-                # "predicted_y": predicted_y.detach().cpu().numpy(),
-                # "adaptive_weights": adaptive_weights.detach().cpu().numpy(),
-                # "pde_residuals": pde_residuals.detach().cpu().numpy()
-            }
+            yield epoch + 1, final_loss

@@ -1,120 +1,81 @@
-# Workflow Template - Create Your Own Custom Workflows
+# DCA_PINN — a PERD workflow
 
-Decline Curve Analysis (DCA) is one of the primary ways to estimate expected pressure declines and total recovery in pressurized porous fluid diffusion systems.
+Decline Curve Analysis (DCA) is one of the primary ways to estimate expected rate declines and total recovery in pressurised porous-media flow systems. This workflow trains a Physics-Informed Neural Network with a Transformer core to predict rate decline while learning, through self-adaptive weights, which of five classical DCA models (exponential, harmonic, hyperbolic, Weibull-type, and a stretched-exponential form) governs each part of each sequence.
 
-In this workflow a Physics Informed Neural Network with a Transformer-based core architecture is used to learn from DCA models in an automatic self-attention driven way how to predict DCA decline. The network learns how to predict DCA accurately by automatically deciding which DCA models to apply at which stage and in which systems.
+It is also the **template for writing your own PERD workflow**: one Python module, one decorator, no Dockerfile.
 
-## Prerequisites
-- Python 3.7+
-- pip package manager
+## How a workflow is written
 
-**Install base dependencies:**
-```bash
-pip install --quiet torch
-pip install --quiet per_datasets
-```
-
-## Using the workflow
 ```python
-import torch
-import per_datasets
+from perd_worker import workflow, WorkflowStreamInput, WorkflowStreamOutput
 
-seq_len = 1000
-batch_size = 4
-input_dim = 1
-D = 2e-2
+@workflow.bi_di
+async def train(
+    inputStream: WorkflowStreamInput[float, float, float, float, float, float, float],
+    epochs: int = 100,
+    learning_rate: float = 0.001,
+) -> WorkflowStreamOutput[int, float]:
+    async for t, q, Di, b, Dinf, n, T in inputStream:
+        ...
+    yield epoch, loss
+```
 
-# ---------------
-# Data generation
-# ---------------
+- Decorate with `@workflow.unary`, `.input_stream`, `.output_stream`, or `.bi_di`; the decorated functions are the workflow's public interface.
+- Parameter and stream item types may be `float`, `int`, `str`, `bool`, or `bytes`. Multi-field stream items are tuples.
+- The module must be importable from the repository root and expose the module-level `workflow` registry; this repository's module is `workflow.py`.
+- `requirements.txt` is installed into the worker image before the SDK.
 
-# t_dummy: Represents input sequence (e.g., time steps)
-# For PINNs, inputs for derivative calculations must have requires_grad=True.
-# Create monotonic increasing time sequences per batch from 0 to 1 with random steps.
-# First value is always zero; values increase in random steps and the final value is 1.
-zeros = torch.zeros(1, batch_size, input_dim) + 1e-4
-increments = torch.rand(seq_len - 1, batch_size, input_dim)
-cumsum = torch.cat([zeros, increments.cumsum(dim=0)], dim=0)
-# Normalize each sequence so its last element equals 1 (avoid division by zero)
-last = cumsum[-1:].clone()
-last[last == 0] = 1.0
-t_dummy = (cumsum / last)
-# Enable gradient tracking for PINN derivative calculations
-t_dummy.requires_grad_()
+## Publishing it on PERD
 
-qi_args = (torch.rand(batch_size, 1) * 1000) + 2500  # Random qi between 2500 and 3500
-
-# Compute true q using qi_args per batch and the analytic decay q = qi * exp(-D * t)
-# qi_args has shape (batch_size, 1); expand to (1, batch_size, 1) to broadcast over seq_len
-q_true_dummy = (qi_args.unsqueeze(0) * torch.exp(-D * t_dummy.detach())) + (torch.rand(seq_len, batch_size, input_dim) * 5)  # Adding small noise
-
-# --------------
-# DCA_PINN usage
-# --------------
-
-with per_datasets.initialize(workflows=['DCA_PINN_Workflow_ID/from/perd-website'], DISK=250, RAM=24, vCPU=8) as pds: # DISK && RAM are in GB
-    results = pds.workflows.DCA_PINN.train(t_dummy, q_true_dummy, epochs=50, learning_rate = 1, live_mode=True)
-    print(f"Final Loss: {results['final_loss']}")
-
-    # Or use pds.visual if imported as pds
-    pds.visual.line_plot(results, y='loss_history', title="PINN Training Loss")
-
-## Server
-
-This repository also provides a small Flask server exposing a `/train` route that accepts a JSON payload and runs the `train` workflow.
-
-Build and run with Docker (example):
+Sign in on the PERD website, open **Store → Publish from GitHub**, and paste this repository's URL. PERD clones it, builds the worker image, describes the contract, and lists the workflow under the id `dca_pinn` (the snake_case slug of the name you give it). The same thing from a terminal:
 
 ```bash
-docker build -t dca_pinn:latest .
-docker run -p 5000:5000 dca_pinn:latest
+pip install perd
+export PERD_API_URL=https://api.perd.app PERD_API_KEY=pak_...
+python -m perd workflow publish --git https://github.com/Mechtanium/DCA_PINN --name "DCA PINN"
 ```
 
-Example `curl` payload (replace arrays with appropriate shapes):
+## Using it from Python
+
+```python
+import asyncio
+import math
+import random
+
+from perd import Workstation
+
+API_URL = "https://api.perd.app"
+API_KEY = "pak_..."          # Store → API Keys on the website
+
+def samples(seq_len=200, batch_size=4, D=2e-2):
+    """One (t, q, Di, b, Dinf, n, T) row per time step: t in [0, 1], q = qi·e^(-D·t) + noise."""
+    for _ in range(seq_len * batch_size):
+        t = random.random()
+        qi = 2500 + random.random() * 1000
+        q = qi * math.exp(-D * t) + random.random() * 5
+        yield (t, q, D, 0.5, 1e-3, 0.5, 1.0)
+
+async def main():
+    ws = await Workstation.connect(API_URL, api_key=API_KEY, workflows=["dca_pinn"])
+    async for epoch, loss in ws.workflows.dca_pinn.train(samples(), epochs=50, learning_rate=0.001):
+        print(f"epoch {epoch}: loss {loss:.4f}")
+
+asyncio.run(main())
+```
+
+`Workstation.connect` resolves the workflow's contract, provisions a workstation running this image, and returns a handle whose methods are materialised from the contract — `help(ws.workflows.dca_pinn.train)` shows the parameters above.
+
+## Running the module locally
 
 ```bash
-curl -X POST http://localhost:5000/train \
-    -H "Content-Type: application/json" \
-    -d '{"X": [[[0.0]]], "Y": [[[1.0]]], "epochs": 10}'
+pip install -r requirements.txt perd-worker
+python -m perd_worker.serve --module workflow --name dca_pinn --port 50051
 ```
 
-├── workflows/
-│   ├── __init__.py                 # Main exports
-│   ├── add/                        # Example workflow
-│   │   ├── __init__.py
-│   │   ├── workflow.py
-│   │   └── requirements.txt
-│   └── my_custom_workflow/         # Your custom workflow
-│       ├── __init__.py
-│       ├── workflow.py
-│       └── requirements.txt             
-└── README.md                      
-```
+## Model
 
-## Running the Flask server
+`PINNTransformer` embeds the time input, runs it through a stack of Transformer encoder layers, and predicts six outputs per step — `q` and the DCA parameters `Di, b, Dinf, n, T` — plus five self-adaptive non-negative weights. `PDEConstraints` evaluates the five decline-model residuals and `PINNLoss` combines the data MSE with the weighted physics residuals.
 
-Local development (dev server):
+## License
 
-```bash
-python main.py
-```
-
-Production (gunicorn):
-
-```bash
-gunicorn --bind 0.0.0.0:5000 main:app
-```
-
-Docker build and run:
-
-```bash
-docker build -t workflow-server .
-docker run -p 5000:5000 workflow-server
-```
-
-Example request:
-
-```bash
-curl -X POST -H "Content-Type: application/json" \
-    -d '{"a":2.5,"b":3.7}' http://localhost:5000/add
-```
+See [LICENSE](LICENSE).

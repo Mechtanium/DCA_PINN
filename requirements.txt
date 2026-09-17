@@ -1,5 +1,5 @@
-Flask==3.1.2
-numpy==2.4.1
+# CPU-only torch keeps the published worker image ~1 GB instead of ~7 GB;
+# the perd worker runs on the workstation's CPU compute class.
+--extra-index-url https://download.pytorch.org/whl/cpu
 torch==2.10.0
-gunicorn==24.1.1
-per-datasets==0.0.6
+numpy==2.4.1
