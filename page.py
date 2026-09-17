@@ -8,7 +8,7 @@ Train, and watch the loss curve as the job runs on the workstation.
 import math
 import random
 
-import perdlit as pl
+from perd_worker import perdlit as pl
 
 from workflow import train
 
