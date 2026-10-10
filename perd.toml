@@ -1,0 +1,11 @@
+# What this workflow asks of the PERD platform. Read by the build; the class
+# is fixed per version and shown (never chosen) at launch.
+[compute]
+class = "small"    # CPU-only torch: 2 vCPU / 8 GiB is plenty for the demo decks
+
+# Store metadata, shown on the workflow's page and in the store.
+[workflow]
+summary  = "Decline-curve analysis with a physics-informed network: trains on production history and streams forecasts with uncertainty bands."
+tags     = ["pinn", "decline-curve", "forecasting", "reservoir"]
+category = "Reservoir"
+license  = "MIT"
