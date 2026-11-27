@@ -98,9 +98,12 @@ class TransformerEncoderLayer(nn.Module):
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
-        # Self-attention block with residual connection and layer normalization
-        attn_output = self.self_attn(x, x, x, mask)
+    def forward(self, x: torch.Tensor, mask: torch.Tensor = None, context: torch.Tensor = None) -> torch.Tensor:
+        # Self-attention block with residual connection and layer normalization.
+        # With a context, the positions of x attend to the context's keys and
+        # values instead of to each other (see PINNTransformer.forward).
+        kv = x if context is None else context
+        attn_output = self.self_attn(x, kv, kv, mask)
         x = x + self.dropout1(attn_output)
         x = self.norm1(x)
 
@@ -120,9 +123,20 @@ class TransformerEncoder(nn.Module):
         ])
         self.norm = nn.LayerNorm(d_model)
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: torch.Tensor = None, context: torch.Tensor = None) -> torch.Tensor:
         # x: (seq_len, batch_size, d_model)
         x = self.pos_encoder(x)
+        if context is not None:
+            # Two streams: the context runs through the layers as ordinary
+            # self-attention, and the query stream x reads the context's state
+            # at the entry of the same layer.
+            context = self.pos_encoder(context)
+            for i, layer in enumerate(self.layers):
+                query = layer(x, mask, context=context)
+                if i + 1 < len(self.layers):
+                    context = layer(context, mask)
+                x = query
+            return self.norm(x)
         for layer in self.layers:
             x = layer(x, mask)
         x = self.norm(x) # Final layer norm, often applied after the last encoder layer
@@ -144,6 +158,35 @@ class SelfAdaptiveWeightPredictionHead(nn.Module):
         # Output shape: (seq_len, batch_size, num_pde_constraints)
         return weights
 
+def time_derivative(q: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    """dq/dt element by element: ``out[s, b] = dq[s, b] / dt[s, b]``.
+
+    ``t`` must be the tensor ``q`` was computed from, with ``requires_grad``,
+    and ``q[s, b]`` must depend on ``t`` only through ``t[s, b]``: true of an
+    analytic curve, and of PINNTransformer's query stream
+    (``model(t, context=times)``). One backward pass then gives all the
+    derivatives at once, because the gradient of ``q.sum()`` at ``t[s, b]`` is
+    ``dq[s, b] / dt[s, b]``. The graph is kept (``create_graph``) so a loss on
+    the derivative trains the model.
+
+    Raises ``ValueError`` instead of returning zeros if ``t`` cannot carry a
+    derivative: a silent zero lost the physics term before.
+    """
+    if not t.requires_grad:
+        raise ValueError(
+            "time_derivative: t does not require grad, so dq/dt cannot be taken; "
+            "pass the tensor the model read, created with requires_grad_(True)"
+        )
+    if t.numel() != q.numel():
+        raise ValueError(
+            f"time_derivative: q {tuple(q.shape)} and t {tuple(t.shape)} must hold one time per rate"
+        )
+    (grad,) = torch.autograd.grad(q.sum(), t, create_graph=True, allow_unused=True)
+    if grad is None:
+        raise ValueError("time_derivative: q does not depend on t")
+    return grad.reshape(q.shape)
+
+
 class PDEConstraints(nn.Module):
     def __init__(self, num_pde_constraints: int):
         super().__init__()
@@ -154,7 +197,8 @@ class PDEConstraints(nn.Module):
 
     def forward(self, model_output: torch.Tensor, input_data: torch.Tensor) -> torch.Tensor:
         # model_output: (seq_len, batch_size, output_dim=6) where output_dim is q, Di, b, Dinf, n, T
-        # input_data: (seq_len, batch_size, input_dim=1) which is 't'
+        # input_data: (seq_len, batch_size, input_dim=1) which is 't': the
+        # tensor the model's query stream consumed, with requires_grad.
 
         seq_len, batch_size, output_dims = model_output.shape
         if input_data.shape[-1] != 1 or output_dims != 6:
@@ -169,31 +213,9 @@ class PDEConstraints(nn.Module):
         n = model_output[:, :, 4] # (seq_len, batch_size)
         T = model_output[:, :, 5] # (seq_len, batch_size)
 
-        # Calculate dq_dt using torch.autograd.grad for each element (element-wise derivative)
-        # Note: This loop is extremely slow for large batches/seq_len. Vectorized grad is harder but possible.
-        # Keeping loop as per original notebook for now.
-        dq_dt_values = torch.zeros_like(q)
-        for s_idx in range(seq_len):
-            for b_idx in range(batch_size):
-                q_scalar = q[s_idx, b_idx]
-                t_scalar = t[s_idx, b_idx]
-
-                # Compute scalar derivative d(q_scalar)/d(t_scalar)
-                if t_scalar.requires_grad:
-                    grad_output = torch.autograd.grad(
-                        outputs=q_scalar,
-                        inputs=t_scalar,
-                        create_graph=True, # Needed to allow backprop through this derivative computation
-                        allow_unused=True  # If q_scalar doesn't depend on t_scalar, it will return None
-                    )[0]
-                else:
-                    grad_output = None
-
-                if grad_output is None:
-                    dq_dt_values[s_idx, b_idx] = torch.tensor(0.0, device=q.device, dtype=q.dtype)
-                else:
-                    dq_dt_values[s_idx, b_idx] = grad_output
-        dq_dt = dq_dt_values
+        # dq[s, b]/dt[s, b], differentiated with respect to the tensor the
+        # model read (a slice such as t above is a new node q never saw).
+        dq_dt = time_derivative(q, input_data)
 
         # Extract qi (initial flow rate) - q at t=0. This will have shape (batch_size,)
         # It's extracted from the first element in the sequence for each batch.
@@ -202,24 +224,34 @@ class PDEConstraints(nn.Module):
         # Expand qi to match (seq_len, batch_size) for element-wise operations with t and Di
         qi_expanded = qi.unsqueeze(0).expand(seq_len, batch_size) # (seq_len, batch_size)
 
-        # pde_1: dq_dt + Di * qi * exp( -Di * t) = 0
+        # Powers of t with a negative exponent (pde_4, pde_5) are infinite at
+        # t = 0, the first step of a decline; they read t from 1e-6.
+        t_stable = torch.max(t, torch.tensor(1e-6))
+
+        # pde_1, exponential, q = qi * exp(-Di * t):
+        # dq_dt + Di * qi * exp( -Di * t) = 0
         pde1_residual = dq_dt + Di * qi_expanded * torch.exp(-Di * t)
 
-        # pde_2: dq_dt + [(Di * qi) / (1 + Di * t)] = 0
-        pde2_residual = dq_dt + (Di * qi_expanded) / (1 + Di * t)
+        # pde_2, harmonic, q = qi / (1 + Di * t):
+        # dq_dt + [(Di * qi) / (1 + Di * t)^2] = 0
+        pde2_residual = dq_dt + (Di * qi_expanded) / (1 + Di * t) ** 2
 
-        # pde_3: dq_dt + [(Di * qi) / (1 + b * Di * t)^(1/b - 1)] = 0
+        # pde_3, hyperbolic, q = qi * (1 + b * Di * t)^(-1/b):
+        # dq_dt + [(Di * qi) / (1 + b * Di * t)^(1/b + 1)] = 0
         pde3_base = (1 + b * Di * t)
-        pde3_exponent = (1 / b - 1)
+        pde3_exponent = (1 / b + 1)
         pde3_residual = dq_dt + (Di * qi_expanded) / torch.pow(torch.max(pde3_base, torch.tensor(1e-6)), pde3_exponent)
 
-        # pde_4: dq_dt + (n * qi / T) * (t/T)^(n-1) * exp(-(t/T)^n)
+        # pde_4, Weibull, q = qi * exp(-(t/T)^n):
+        # dq_dt + (n * qi / T) * (t/T)^(n-1) * exp(-(t/T)^n) = 0
         T_stable = torch.max(T, torch.tensor(1e-6))
-        t_div_T = t / T_stable
+        t_div_T = t_stable / T_stable
         pde4_residual = dq_dt + (n * qi_expanded / T_stable) * torch.pow(t_div_T, n - 1) * torch.exp(-torch.pow(t_div_T, n))
 
-        # pde_5: dq_dt - qi * ((Di * t^(-n)) - Dinf) * exp((D/(1-n)) * (t^(1-n) - 1) - Dinf * t)
-        t_stable = torch.max(t, torch.tensor(1e-6))
+        # pde_5, q = qi * exp((Di/(1-n)) * (t^(1-n) - 1) - Dinf * t), a model in
+        # which qi scales the rate at t = 1; like the others, the residual
+        # takes qi from the first step:
+        # dq_dt - qi * ((Di * t^(-n)) - Dinf) * exp((D/(1-n)) * (t^(1-n) - 1) - Dinf * t)
         pde5_term1 = (Di * torch.pow(t_stable, -n)) - Dinf
         pde5_term2_exponent = (Di / torch.max(torch.tensor(1e-6), (1 - n))) * (torch.pow(t_stable, (1 - n)) - 1) - Dinf * t
         pde5_residual = dq_dt - qi * pde5_term1 * torch.exp(pde5_term2_exponent)
@@ -229,6 +261,14 @@ class PDEConstraints(nn.Module):
 
         return pde_residuals
 
+def _require_same_shape(name_a: str, a: torch.Tensor, name_b: str, b: torch.Tensor) -> None:
+    """Refuse an element-wise comparison that would broadcast instead of match."""
+    if a.shape != b.shape:
+        raise ValueError(
+            f"{name_a} {tuple(a.shape)} and {name_b} {tuple(b.shape)} must have the same shape"
+        )
+
+
 class PINNLoss(nn.Module):
     def __init__(self, lambda_data: float = 1.0, lambda_pde: float = 1.0):
         super().__init__()
@@ -237,10 +277,19 @@ class PINNLoss(nn.Module):
         self.mse_loss = nn.MSELoss()
 
     def forward(self, predicted_y: torch.Tensor, true_y: torch.Tensor, predicted_weights: torch.Tensor, pde_residuals: torch.Tensor) -> torch.Tensor:
-        # 1. Calculate data loss (e.g., MSE)
-        data_loss = self.mse_loss(predicted_y[:, :, 0].unsqueeze(-1), true_y)
+        # predicted_y, true_y: (seq_len, batch_size, 6) with (q, Di, b, Dinf, n, T)
+        # in the last dimension. predicted_weights, pde_residuals:
+        # (seq_len, batch_size, num_pde_constraints).
+
+        # 1. Data loss: the predicted rate against the observed rate, column 0
+        # of both. The decline parameters are learnt through the residuals.
+        q_pred = predicted_y[..., 0:1]
+        q_true = true_y[..., 0:1]
+        _require_same_shape("predicted q", q_pred, "observed q", q_true)
+        data_loss = self.mse_loss(q_pred, q_true)
 
         # 2. Calculate PDE loss
+        _require_same_shape("adaptive weights", predicted_weights, "PDE residuals", pde_residuals)
         # Square the PDE residuals
         squared_pde_residuals = pde_residuals.pow(2)
 
@@ -279,14 +328,28 @@ class PINNTransformer(nn.Module):
         # 2d. Self-Adaptive Weight Prediction Head
         self.weight_head = SelfAdaptiveWeightPredictionHead(d_model, num_pde_constraints)
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> tuple[torch.Tensor, torch.Tensor]:
-        # x: (seq_len, batch_size, input_dim)
+    def forward(self, x: torch.Tensor, mask: torch.Tensor = None, context: torch.Tensor = None) -> tuple[torch.Tensor, torch.Tensor]:
+        """Predict the six outputs and the adaptive weights at the times ``x``.
+
+        x: (seq_len, batch_size, input_dim). Without ``context`` the positions
+        of ``x`` attend to each other, so the prediction at one time depends
+        on all the times of its sequence.
+
+        With ``context`` (the observed times, same shape), ``x`` holds query
+        times: position ``s`` of ``x`` attends to the context's keys and
+        values, so the outputs at ``s`` depend on ``x`` only through
+        ``x[s]``. Passing the observed times as both gives the same values as
+        ``model(x)``, and the gradient with respect to ``x`` is then the slope
+        of the predicted decline at the query times with the observations held
+        fixed: one backward pass (``time_derivative``) instead of one per time.
+        """
 
         # 3b. Pass input x through the initial embedding layer
         embedded_x = self.embedding(x)
+        embedded_context = None if context is None else self.embedding(context)
 
         # 3c. Pass the embedded input through the TransformerEncoder
-        encoder_output = self.transformer_encoder(embedded_x, mask)
+        encoder_output = self.transformer_encoder(embedded_x, mask, context=embedded_context)
 
         # 3d. Use the encoder_output to predict the sequential output y
         predicted_y_raw = self.output_head(encoder_output)
@@ -330,9 +393,15 @@ async def train(
 ) -> WorkflowStreamOutput[int, float]:
     """Train the PINN Transformer on a stream of decline-curve samples.
 
-    Stream in one item per time step: ``(t, q, Di, b, Dinf, n, T)`` — the
-    time and the six targets (rate plus the five DCA parameters). Items are
-    consumed in order and folded into sequences of ``batch_size`` rows.
+    Stream in one item per time step: ``(t, q, Di, b, Dinf, n, T)``, the
+    time, the observed rate and the five DCA parameters. The data loss
+    compares the predicted rate with ``q``; the network infers the five
+    parameters through the physics residuals, so their columns are read but
+    not compared with anything. Items are consumed in order and interleaved
+    into ``batch_size`` sequences: item ``i`` is time step ``i // batch_size``
+    of sequence ``i % batch_size``. The physics residuals take the rate at
+    the first step of a sequence as its initial rate ``qi``, so sequences
+    should start at the beginning of the decline (``t = 0``).
 
     Streams out ``(epoch, loss)`` on the first epoch and every
     ``report_every`` epochs after that, so a client can plot the loss live.
@@ -363,6 +432,11 @@ async def train(
     learning_rate = float(learning_rate)
     lambda_data = float(lambda_data)
     lambda_pde = float(lambda_pde)
+    if output_dim != 6 or num_pde_constraints != 5:
+        raise ValueError(
+            "train: output_dim must be 6 (q, Di, b, Dinf, n, T) and num_pde_constraints "
+            f"5 (one per decline model); got {output_dim} and {num_pde_constraints}"
+        )
 
     data = []
     async for x, q, Di, b, Dinf, n, T in inputStream:
@@ -384,8 +458,6 @@ async def train(
     input_dim = data_t.shape[-1] - output_dim  # Assuming last 6 columns are true_y (q, Di, b, Dinf, n, T)
     X = data_t[:, :, :input_dim]
     Y = data_t[:, :, input_dim:]
-
-    pde_input_dummy = X
 
     # Model instantiation
     model = PINNTransformer(
@@ -411,8 +483,11 @@ async def train(
         model.train()
         optimizer.zero_grad()
 
-        predicted_y, adaptive_weights = model(X)
-        pde_residuals = pde_constraints_module(predicted_y, pde_input_dummy)
+        # The observed times again, as a leaf that can carry dq/dt: the query
+        # stream reads it and the context stream reads X (same values).
+        t_query = X.clone().requires_grad_(True)
+        predicted_y, adaptive_weights = model(t_query, context=X)
+        pde_residuals = pde_constraints_module(predicted_y, t_query)
 
         total_loss = pinn_loss_fn(
             predicted_y=predicted_y,
@@ -421,7 +496,7 @@ async def train(
             pde_residuals=pde_residuals
         )
 
-        total_loss.backward(retain_graph=True)
+        total_loss.backward()
         optimizer.step()
 
         final_loss = total_loss.item()
