@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.3.0
+
+`train` now identifies the decline model behind the rates. **Its output items change**, so callers that unpack `(epoch, loss)` must read the new items; its inputs and parameters are unchanged.
+
+### Changed
+
+- **Outputs:** `(epoch, loss, model, w_exponential, w_harmonic, w_hyperbolic, w_weibull, w_power_law_exponential)`. `model` names the model with the largest weight; the weights are a softmax over five learnt logits and sum to 1.
+- **The residual weights** are one learnt distribution per run instead of a non-negative weight per time step. They stay uniform for the first third of the epochs, then move towards the model whose closed-form curve fits the rates best; on generated data they end above 0.98 for the generating model.
+- **The decline parameters** are fitted per well and per model, inside bounds that keep the families apart, instead of being predicted per time step and shared by the models.
+- **The fifth model** is the power-law exponential, `q = qi exp(-Dinf t - Di t^n)`. The former form rose before it fell, and its own curve could not satisfy its residual.
+- Times and rates are scaled inside `train` (rates per well), so any units work. The network no longer predicts per-step parameters; a rate is a function of its time.
+
+### Added
+
+- `synthetic_declines(model, wells, steps, noise, seed)`: analytic ground truth from one decline model, named or drawn at random, with the generating parameters in the five parameter columns.
+- The page generates such declines, names the true model, and charts the five weights as they learn next to the loss.
+- Tests: the five residuals tell their curves apart, and training on any one model's data ends with that model's weight above 0.9.
+
 ## 0.2.0
 
 The physics now takes part in training. The operation `train` keeps its name, its parameters and its stream items, so existing calls and pages work unchanged; the losses it reports differ from 0.1.x.
