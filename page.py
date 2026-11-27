@@ -25,7 +25,7 @@ with pl.sidebar:
     pl.header("Data")
     source = pl.radio("Source", ["Synthetic decline", "Upload CSV"])
     if source == "Synthetic decline":
-        seq_len = pl.slider("Sequence length", 20, 1000, 200, step=10)
+        seq_len = pl.slider("Sequence length", 20, 500, 200, step=10)
         decline = pl.slider("Decline rate D", 0.005, 0.2, 0.02, step=0.005)
         noise = pl.slider("Noise (rate units)", 0.0, 50.0, 5.0, step=1.0)
         seed = pl.number_input("Random seed", 0, 9999, 7)
@@ -40,8 +40,8 @@ with pl.sidebar:
     learning_rate = pl.number_input("Learning rate", 1e-5, 1.0, 0.001, step=0.0005)
     report_every = pl.number_input("Report every N epochs", 1, 500, 10)
     with pl.expander("Model"):
-        d_model = pl.selectbox("d_model", [32, 64, 128], index=1)
-        num_layers = pl.slider("Encoder layers", 1, 6, 2)
+        d_model = pl.selectbox("d_model", [32, 64], index=1)
+        num_layers = pl.slider("Encoder layers", 1, 4, 2)
         num_heads = pl.selectbox("Attention heads", [2, 4, 8], index=1)
         lambda_pde = pl.slider("Physics weight λ_pde", 0.0, 5.0, 1.0, step=0.1)
 
