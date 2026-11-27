@@ -1,5 +1,9 @@
-# CPU-only torch keeps the published worker image ~1 GB instead of ~7 GB;
-# the perd worker runs on the workstation's CPU compute class.
+# The workflow's own Python dependencies. The build installs perd-worker
+# itself, after this file and pinned to the control plane's version: do not
+# list it here.
+#
+# CPU-only torch wheels keep the image near 1 GB instead of 7 GB; the
+# workflow runs on the small (CPU) compute class declared in perd.toml.
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch==2.10.0
 numpy==2.4.1

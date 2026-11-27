@@ -1,0 +1,17 @@
+# PERD's build and Store settings for this workflow.
+# Guide: https://perd.app/docs/workflows/publishing/#compute-class-perdtoml
+
+[compute]
+# The machine the workflow runs on: small, medium, large or gpu_t4.
+# small is 2 vCPU and 8 GiB. The model is a 68k-parameter Transformer on
+# CPU-only torch (requirements.txt), so a GPU would sit idle. At the page's
+# defaults (200 steps, batch 4) an epoch takes about 0.05 s and the worker
+# about 0.4 GB; 1000 steps at batch 8 need about 2.6 s per epoch and 3.2 GB.
+class = "small"
+
+[workflow]
+summary = "Decline-curve analysis with a physics-informed Transformer: it fits the rate decline while self-adaptive weights choose among five classical decline models."
+tags = ["decline-curve", "pinn", "production", "reservoir", "transformer"]
+category = "Reservoir"
+license = "MIT"
+homepage = "https://github.com/Mechtanium/DCA_PINN"
