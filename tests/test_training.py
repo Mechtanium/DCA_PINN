@@ -1,49 +1,57 @@
-"""A short training run on synthetic Arps declines: the loss falls.
+"""Training on one model's declines drives that model's weight towards 1.
 
-Four wells with hyperbolic declines q = qi (1 + b Di t)^(-1/b), sampled at
-24 times from t = 0, with rates scaled to qi = 1 and a little noise. The rows
-are streamed exactly as a client streams them: interleaved, so that row i is
-time step i // 4 of well i % 4.
+synthetic_declines draws four wells from one decline model (seeded); train
+runs with its defaults (100 epochs) on CPU, about a second per model, and
+must end with the generating model's weight above 0.9, the model it names
+being that one.
 """
 
 import asyncio
+import contextlib
+import io
 import math
-import random
 import statistics
 
+import pytest
 import torch
 
 import workflow as wf
 
-WELLS = [(1.0, 2.0, 0.5), (0.9, 3.0, 0.8), (0.8, 1.5, 0.3), (1.1, 2.5, 0.6)]  # (qi, Di, b)
-STEPS = 24
 
-
-def arps_rows(seed=0):
-    rng = random.Random(seed)
-    rows = []
-    for step in range(STEPS):
-        t = step / (STEPS - 1)
-        for qi, Di, b in WELLS:
-            q = qi * (1 + b * Di * t) ** (-1 / b) * (1 + 0.01 * rng.gauss(0, 1))
-            rows.append((t, q, Di, b, 1e-3, 0.5, 1.0))
-    return rows
-
-
-async def train_losses(rows, **kwargs):
+async def train_outputs(rows, **kwargs):
     async def stream():
         for row in rows:
             yield row
 
-    return [loss async for _, loss in wf.train(stream(), **kwargs)]
+    with contextlib.redirect_stdout(io.StringIO()):
+        return [item async for item in wf.train(stream(), **kwargs)]
 
 
-def test_a_few_epochs_on_arps_declines_make_the_loss_fall():
+@pytest.mark.parametrize("model", wf.DECLINE_MODELS)
+def test_training_finds_the_generating_model(model):
     torch.manual_seed(0)
-    losses = asyncio.run(train_losses(arps_rows(), batch_size=len(WELLS), epochs=40, report_every=1))
-    assert len(losses) == 40
-    assert all(math.isfinite(loss) for loss in losses)
-    # Medians of five epochs: the fifth model's t^(-n) is singular at t = 0
-    # and can spike an early epoch before the adaptive weights damp it.
-    first, last = statistics.median(losses[:5]), statistics.median(losses[-5:])
-    assert last < 0.5 * first, (first, last)
+    _, rows = wf.synthetic_declines(model, wells=4, steps=32, seed=0)
+    outputs = asyncio.run(train_outputs(rows, batch_size=4, report_every=1))
+    assert len(outputs) == 100
+    epoch, loss, chosen, *weights = outputs[-1]
+    assert chosen == model
+    assert weights[wf.DECLINE_MODELS.index(model)] > 0.9, dict(zip(wf.DECLINE_MODELS, weights))
+    assert sum(weights) == pytest.approx(1.0)
+    losses = [item[1] for item in outputs]
+    assert all(math.isfinite(value) for value in losses)
+    assert statistics.median(losses[-5:]) < 0.5 * statistics.median(losses[:5])
+
+
+def test_the_weights_stay_uniform_during_the_warm_up():
+    torch.manual_seed(0)
+    _, rows = wf.synthetic_declines("weibull", wells=2, steps=16, seed=1)
+    outputs = asyncio.run(train_outputs(rows, batch_size=2, epochs=30, report_every=1, d_model=16, num_heads=2))
+    warmup = int(30 * wf.WARMUP_SHARE)
+    for _, _, _, *weights in outputs[: warmup - 1]:
+        assert weights == pytest.approx([0.2] * 5)
+
+
+def test_a_random_model_is_drawn_from_the_seed():
+    names = {wf.synthetic_declines(None, wells=1, steps=4, seed=seed)[0] for seed in range(40)}
+    assert names == set(wf.DECLINE_MODELS)
+    assert wf.synthetic_declines(None, seed=3) == wf.synthetic_declines(None, seed=3)

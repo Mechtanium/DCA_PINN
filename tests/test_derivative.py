@@ -28,7 +28,7 @@ def times():
 
 def small_model():
     torch.manual_seed(0)
-    model = wf.PINNTransformer(1, 6, 2, 16, 2, 32, 5, dropout=0.1).double()
+    model = wf.PINNTransformer(1, num_layers=2, d_model=16, num_heads=2, dim_feedforward=32, num_wells=B, dropout=0.1).double()
     return model.eval()
 
 
@@ -52,7 +52,7 @@ def test_dq_dt_of_the_model_matches_finite_differences_position_by_position():
     model = small_model()
     X = times()
     t_query = X.clone().requires_grad_(True)
-    q = model(t_query, context=X)[0][..., 0]
+    q = model(t_query, context=X)[..., 0]
 
     dq_dt = wf.time_derivative(q, t_query).detach()
 
@@ -64,8 +64,8 @@ def test_dq_dt_of_the_model_matches_finite_differences_position_by_position():
                 plus, minus = X.clone(), X.clone()
                 plus[s, col, 0] += h
                 minus[s, col, 0] -= h
-                q_plus = model(plus, context=X)[0][s, col, 0]
-                q_minus = model(minus, context=X)[0][s, col, 0]
+                q_plus = model(plus, context=X)[s, col, 0]
+                q_minus = model(minus, context=X)[s, col, 0]
                 fd[s, col] = (q_plus - q_minus) / (2 * h)
     assert dq_dt.abs().min() > 1e-6, "dq/dt must not vanish"
     torch.testing.assert_close(dq_dt, fd, rtol=1e-6, atol=1e-8)
@@ -77,32 +77,24 @@ def test_a_query_time_moves_only_its_own_prediction():
     moved = X.clone()
     moved[4, 1, 0] += 0.3
     with torch.no_grad():
-        before = model(X, context=X)[0]
-        after = model(moved, context=X)[0]
+        before = model(X, context=X)
+        after = model(moved, context=X)
     changed = (after - before).abs().amax(dim=-1) > 0
     assert changed[4, 1]
     changed[4, 1] = False
     assert not changed.any()
 
 
-def test_reading_the_times_as_queries_and_context_changes_no_prediction():
+def test_a_rate_is_a_function_of_its_time_not_of_its_slot():
+    # The query stream carries no positional encoding: the same time in two
+    # slots of a well gives the same rate, so dq/dt is the slope of one curve.
     model = small_model()
     X = times()
+    moved = X.clone()
+    moved[7, 1, 0] = X[2, 1, 0]
     with torch.no_grad():
-        plain_y, plain_w = model(X)
-        query_y, query_w = model(X, context=X)
-    torch.testing.assert_close(query_y, plain_y, rtol=0, atol=1e-12)
-    torch.testing.assert_close(query_w, plain_w, rtol=0, atol=1e-12)
-
-
-def test_the_exponential_residual_vanishes_on_an_exponential_decline():
-    qi, Di = 1000.0, 1.5
-    t = times().requires_grad_(True)
-    q = qi * torch.exp(-Di * t)
-    params = torch.tensor([Di, 0.5, 1e-3, 0.5, 1.0], dtype=torch.float64).expand(S, B, 5)
-    residuals = wf.PDEConstraints(5)(torch.cat([q, params], dim=-1), t)
-    # With dq/dt taken as zero this residual would be Di * q, up to 1500.
-    torch.testing.assert_close(residuals[..., 0], torch.zeros(S, B, dtype=torch.float64), rtol=0, atol=1e-9)
+        q = model(moved, context=X)[..., 0]
+    torch.testing.assert_close(q[7, 1], q[2, 1], rtol=0, atol=1e-12)
 
 
 def test_times_without_grad_are_refused_instead_of_giving_zero():
