@@ -1,0 +1,15 @@
+<svg viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="DCA PINN">
+  <!-- The 16 px drawing of favicon.svg: the decline and its time axis only,
+       weight 8 (2 px), the axis on whole pixels. -->
+  <defs>
+    <linearGradient id="dca-tile" x1="4" y1="60" x2="60" y2="4" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#7150c1"/>
+      <stop offset="1" stop-color="#d46bd9"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="14" fill="url(#dca-tile)"/>
+  <g stroke="#fdfbf7" stroke-width="8" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M 14 52 H 50"/>
+    <path d="M 16 12 C 16.64 15.97 17.29 18.74 17.93 20.98 C 19.24 25.54 20.55 27.96 21.86 29.85 C 23.65 32.42 25.43 33.81 27.22 34.89 C 29.4 36.22 31.59 36.99 33.77 37.6 C 36.31 38.31 38.86 38.76 41.4 39.11 C 44.26 39.51 47.13 39.78 50 40"/>
+  </g>
+</svg>

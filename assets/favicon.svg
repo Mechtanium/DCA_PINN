@@ -1,0 +1,41 @@
+<svg viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="DCA PINN">
+  <!-- DCA PINN, drawn at 256, 128, 64 and 48 px (favicon-32.svg and
+       favicon-16.svg are the simplified small sizes).
+       The PERD tile (radius 14, violet to orchid along the diagonal) carries
+       an Arps hyperbolic decline q = qi (1 + b Di t)^(-1/b), b = 0.6, Di t = 7
+       at the right end, as cubic Beziers with exact tangents; three
+       observations scattered about it; and, lighter, the 3-2-1 network that
+       learns it. Warm-white strokes, round caps and joins: weight 5 for the
+       chart, a third of that for the network. -->
+  <defs>
+    <linearGradient id="dca-tile" x1="4" y1="60" x2="60" y2="4" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#7150c1"/>
+      <stop offset="1" stop-color="#d46bd9"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="14" fill="url(#dca-tile)"/>
+
+  <!-- The network: edges trimmed to the rings, group opacity so crossings do not stack. -->
+  <g stroke="#fdfbf7" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+    <path opacity="0.5" d="M 37.67 13.76 L 40.83 15.24 M 36.71 14.91 L 41.79 22.09 M 37.67 19.24 L 40.83 17.76 M 37.67 21.76 L 40.83 23.24 M 36.71 26.09 L 41.79 18.91 M 37.67 27.24 L 40.83 25.76 M 46.17 17.76 L 49.33 19.24 M 46.17 23.24 L 49.33 21.76"/>
+    <g opacity="0.8">
+      <circle cx="35" cy="12.5" r="2.1"/>
+      <circle cx="35" cy="20.5" r="2.1"/>
+      <circle cx="35" cy="28.5" r="2.1"/>
+      <circle cx="43.5" cy="16.5" r="2.1"/>
+      <circle cx="43.5" cy="24.5" r="2.1"/>
+      <circle cx="52" cy="20.5" r="2.1"/>
+    </g>
+  </g>
+
+  <!-- The chart: time axis, decline curve, observations. -->
+  <g stroke="#fdfbf7" stroke-width="5" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M 13 51.5 H 49"/>
+    <path d="M 14 14.5 C 14.66 18.33 15.33 21 15.99 23.16 C 17.34 27.55 18.69 29.89 20.03 31.71 C 21.87 34.19 23.71 35.53 25.55 36.57 C 27.8 37.85 30.04 38.6 32.29 39.19 C 34.91 39.87 37.53 40.3 40.14 40.64 C 43.1 41.03 46.05 41.29 49 41.5"/>
+  </g>
+  <g fill="#fdfbf7">
+    <circle cx="21.05" cy="18.94" r="2.75"/>
+    <circle cx="17.47" cy="37.91" r="2.75"/>
+    <circle cx="38.99" cy="34.42" r="2.75"/>
+  </g>
+</svg>

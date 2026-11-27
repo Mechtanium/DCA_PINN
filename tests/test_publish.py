@@ -6,6 +6,7 @@ publish there.
 """
 
 import asyncio
+import struct
 import tomllib
 from pathlib import Path
 
@@ -49,6 +50,21 @@ def test_perd_toml_passes_the_build_schema():
     assert len(meta["summary"]) <= 500
     assert len(meta["tags"]) <= 12 and all(len(tag) <= 32 for tag in meta["tags"])
     assert all(len(meta[key]) <= 200 for key in ("category", "license", "homepage"))
+
+
+def test_the_icon_is_one_the_build_accepts():
+    data = (ROOT / "favicon.ico").read_bytes()
+    assert data[:4] == b"\x00\x00\x01\x00"  # ICO
+    assert len(data) <= 256 * 1024
+    (count,) = struct.unpack_from("<H", data, 4)
+    sizes = []
+    for entry in range(count):
+        width, height, _, _, _, bits, length, offset = struct.unpack_from("<BBBBHHII", data, 6 + 16 * entry)
+        assert width == height and bits == 32
+        assert offset + length <= len(data)
+        assert data[offset : offset + 8] == b"\x89PNG\r\n\x1a\n"
+        sizes.append(width or 256)
+    assert sorted(sizes) == [16, 32, 48, 64, 128, 256]
 
 
 def test_requirements_leave_perd_worker_to_the_build():
