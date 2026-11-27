@@ -251,6 +251,14 @@ class PDEConstraints(nn.Module):
 
         return pde_residuals
 
+def _require_same_shape(name_a: str, a: torch.Tensor, name_b: str, b: torch.Tensor) -> None:
+    """Refuse an element-wise comparison that would broadcast instead of match."""
+    if a.shape != b.shape:
+        raise ValueError(
+            f"{name_a} {tuple(a.shape)} and {name_b} {tuple(b.shape)} must have the same shape"
+        )
+
+
 class PINNLoss(nn.Module):
     def __init__(self, lambda_data: float = 1.0, lambda_pde: float = 1.0):
         super().__init__()
@@ -259,10 +267,19 @@ class PINNLoss(nn.Module):
         self.mse_loss = nn.MSELoss()
 
     def forward(self, predicted_y: torch.Tensor, true_y: torch.Tensor, predicted_weights: torch.Tensor, pde_residuals: torch.Tensor) -> torch.Tensor:
-        # 1. Calculate data loss (e.g., MSE)
-        data_loss = self.mse_loss(predicted_y[:, :, 0].unsqueeze(-1), true_y)
+        # predicted_y, true_y: (seq_len, batch_size, 6) with (q, Di, b, Dinf, n, T)
+        # in the last dimension. predicted_weights, pde_residuals:
+        # (seq_len, batch_size, num_pde_constraints).
+
+        # 1. Data loss: the predicted rate against the observed rate, column 0
+        # of both. The decline parameters are learnt through the residuals.
+        q_pred = predicted_y[..., 0:1]
+        q_true = true_y[..., 0:1]
+        _require_same_shape("predicted q", q_pred, "observed q", q_true)
+        data_loss = self.mse_loss(q_pred, q_true)
 
         # 2. Calculate PDE loss
+        _require_same_shape("adaptive weights", predicted_weights, "PDE residuals", pde_residuals)
         # Square the PDE residuals
         squared_pde_residuals = pde_residuals.pow(2)
 
@@ -366,9 +383,13 @@ async def train(
 ) -> WorkflowStreamOutput[int, float]:
     """Train the PINN Transformer on a stream of decline-curve samples.
 
-    Stream in one item per time step: ``(t, q, Di, b, Dinf, n, T)`` — the
-    time and the six targets (rate plus the five DCA parameters). Items are
-    consumed in order and folded into sequences of ``batch_size`` rows.
+    Stream in one item per time step: ``(t, q, Di, b, Dinf, n, T)``, the
+    time, the observed rate and the five DCA parameters. The data loss
+    compares the predicted rate with ``q``; the network infers the five
+    parameters through the physics residuals, so their columns are read but
+    not compared with anything. Items are consumed in order and interleaved
+    into ``batch_size`` sequences: item ``i`` is time step ``i // batch_size``
+    of sequence ``i % batch_size``.
 
     Streams out ``(epoch, loss)`` on the first epoch and every
     ``report_every`` epochs after that, so a client can plot the loss live.
@@ -399,6 +420,11 @@ async def train(
     learning_rate = float(learning_rate)
     lambda_data = float(lambda_data)
     lambda_pde = float(lambda_pde)
+    if output_dim != 6 or num_pde_constraints != 5:
+        raise ValueError(
+            "train: output_dim must be 6 (q, Di, b, Dinf, n, T) and num_pde_constraints "
+            f"5 (one per decline model); got {output_dim} and {num_pde_constraints}"
+        )
 
     data = []
     async for x, q, Di, b, Dinf, n, T in inputStream:
