@@ -1,13 +1,19 @@
 """DCA_PINN: a Physics-Informed Transformer for decline-curve analysis, as a
 PERD workflow.
 
-The module-level ``workflow`` registry (from ``perd_worker``) is what PERD
-serves: publish this repository on the website (or with ``python -m perd
-workflow publish --git <this repo>``), start a workstation on it, and call
+``train`` fits a Transformer to the rates of a few wells and identifies the
+decline model behind them: exponential, harmonic, hyperbolic, Weibull or
+power-law exponential. ``synthetic_declines`` generates analytic ground
+truth from one of those models, for the page and the tests.
+
+PERD serves the module-level ``workflow`` registry (from ``perd_worker``):
+publish this repository on the website (or with ``python -m perd workflow
+publish --git <this repo>``), start a workspace on it, and call
 ``ws.workflows.dca_pinn.train(...)`` from the ``perd`` library.
 """
 
 import math
+import random
 
 import torch
 import torch.nn as nn
@@ -125,11 +131,11 @@ class TransformerEncoder(nn.Module):
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor = None, context: torch.Tensor = None) -> torch.Tensor:
         # x: (seq_len, batch_size, d_model)
-        x = self.pos_encoder(x)
         if context is not None:
             # Two streams: the context runs through the layers as ordinary
             # self-attention, and the query stream x reads the context's state
-            # at the entry of the same layer.
+            # at the entry of the same layer. The query carries no positional
+            # encoding, so its outputs are functions of its times, not of slots.
             context = self.pos_encoder(context)
             for i, layer in enumerate(self.layers):
                 query = layer(x, mask, context=context)
@@ -137,26 +143,161 @@ class TransformerEncoder(nn.Module):
                     context = layer(context, mask)
                 x = query
             return self.norm(x)
+        x = self.pos_encoder(x)
         for layer in self.layers:
             x = layer(x, mask)
         x = self.norm(x) # Final layer norm, often applied after the last encoder layer
         return x
 
-class SelfAdaptiveWeightPredictionHead(nn.Module):
-    def __init__(self, d_model: int, num_pde_constraints: int):
-        super().__init__()
-        self.linear = nn.Linear(d_model, num_pde_constraints)
-        # Using Softplus to ensure non-negative weights
-        self.activation = nn.Softplus()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (seq_len, batch_size, d_model)
-        # Apply linear layer
-        weights = self.linear(x)
-        # Apply activation to ensure non-negative weights
-        weights = self.activation(weights)
-        # Output shape: (seq_len, batch_size, num_pde_constraints)
-        return weights
+# ── The five decline models ─────────────────────────────────────────────────
+#: The decline models, in the order of their residuals and of their weights.
+DECLINE_MODELS = ("exponential", "harmonic", "hyperbolic", "weibull", "power_law_exponential")
+
+#: Bounds of the parameters train fits for all models and wells, in train's
+#: normalised units (times divided by the longest time, rates by the largest
+#: rate). The bounds keep the families apart: hyperbolic b stays clear of 0
+#: (exponential) and 1 (harmonic), and the power-law exponential's D_inf and
+#: Di clear of 0 (Weibull and exponential), so only the generating model can
+#: zero its residual.
+FIT_RANGES = {
+    "exponential": {"qi": (0.3, 5.0), "Di": (0.05, 30.0)},
+    "harmonic": {"qi": (0.3, 5.0), "Di": (0.05, 100.0)},
+    "hyperbolic": {"qi": (0.3, 5.0), "Di": (0.05, 100.0), "b": (0.25, 0.75)},
+    "weibull": {"qi": (0.3, 5.0), "T": (0.01, 10.0), "n": (0.15, 0.85)},
+    "power_law_exponential": {"qi": (0.3, 5.0), "Di": (0.5, 10.0), "Dinf": (1.2, 10.0), "n": (0.15, 0.75)},
+}
+#: Parameters fitted on a linear scale; the others are rates and times, fitted
+#: on a log scale.
+LINEAR_PARAMETERS = {"b", "n"}
+
+#: Parameter ranges of synthetic_declines (times from 0 to 1), inside FIT_RANGES.
+SYNTHETIC_RANGES = {
+    "exponential": {"Di": (2.0, 4.0)},
+    "harmonic": {"Di": (5.0, 15.0)},
+    "hyperbolic": {"Di": (5.0, 15.0), "b": (0.4, 0.6)},
+    "weibull": {"T": (0.1, 0.5), "n": (0.3, 0.5)},
+    "power_law_exponential": {"Di": (1.0, 2.0), "Dinf": (2.5, 4.0), "n": (0.3, 0.5)},
+}
+#: Initial rates of the synthetic wells, in rate units.
+SYNTHETIC_QI = (800.0, 3000.0)
+
+
+def decline_rate(model: int, t: torch.Tensor, p: dict) -> torch.Tensor:
+    """q(t) of decline model ``model`` (an index into DECLINE_MODELS) with parameters ``p``."""
+    qi = p["qi"]
+    if model == 0:  # exponential
+        return qi * torch.exp(-p["Di"] * t)
+    if model == 1:  # harmonic
+        return qi / (1 + p["Di"] * t)
+    if model == 2:  # hyperbolic (Arps)
+        return qi * (1 + p["b"] * p["Di"] * t) ** (-1 / p["b"])
+    if model == 3:  # Weibull (stretched exponential)
+        return qi * torch.exp(-((t / p["T"]) ** p["n"]))
+    # power-law exponential (Ilk et al., 2008)
+    return qi * torch.exp(-p["Dinf"] * t - p["Di"] * t ** p["n"])
+
+
+def decline_slope(model: int, t: torch.Tensor, p: dict) -> torch.Tensor:
+    """dq/dt of decline model ``model``: the closed form its residual compares with."""
+    qi = p["qi"]
+    # Powers of t with a negative exponent (Weibull, power-law exponential)
+    # are infinite at t = 0; they read t from 1e-6.
+    t_stable = torch.clamp(t, min=1e-6)
+    if model == 0:
+        return -p["Di"] * qi * torch.exp(-p["Di"] * t)
+    if model == 1:
+        return -p["Di"] * qi / (1 + p["Di"] * t) ** 2
+    if model == 2:
+        return -p["Di"] * qi * (1 + p["b"] * p["Di"] * t) ** (-1 / p["b"] - 1)
+    if model == 3:
+        x = t_stable / p["T"]
+        return -(p["n"] / p["T"]) * x ** (p["n"] - 1) * qi * torch.exp(-(x ** p["n"]))
+    return -(p["Dinf"] + p["n"] * p["Di"] * t_stable ** (p["n"] - 1)) * decline_rate(4, t_stable, p)
+
+
+def synthetic_declines(model=None, wells: int = 4, steps: int = 50, noise: float = 0.0, seed: int = 0):
+    """Analytic ground truth for train: ``(model name, rows)``.
+
+    One decline model generates all the wells: ``model`` names it (a name from
+    DECLINE_MODELS or its index), or ``None`` draws it at random from
+    ``seed``. The wells draw their own initial rates from SYNTHETIC_QI and their
+    parameters from SYNTHETIC_RANGES, and are sampled at ``steps`` times
+    ``1/steps, 2/steps, ..., 1`` (after t = 0, where the Weibull and
+    power-law exponential curves fall infinitely fast). ``noise`` is a
+    relative Gaussian error on the rates.
+
+    The rows are train's input, ``(t, q, Di, b, Dinf, n, T)`` interleaved by
+    step (row ``i`` is step ``i // wells`` of well ``i % wells``), with the
+    generating parameters in the last five columns and 0 for the parameters
+    the model does not use.
+    """
+    rng = random.Random(seed)
+    if model is None:
+        index = rng.randrange(len(DECLINE_MODELS))
+    elif isinstance(model, str):
+        index = DECLINE_MODELS.index(model)
+    else:
+        index = int(model)
+    name = DECLINE_MODELS[index]
+    params = []
+    for _ in range(int(wells)):
+        p = {"qi": rng.uniform(*SYNTHETIC_QI), "Di": 0.0, "b": 0.0, "Dinf": 0.0, "n": 0.0, "T": 0.0}
+        for key, (low, high) in SYNTHETIC_RANGES[name].items():
+            p[key] = rng.uniform(low, high)
+        params.append(p)
+    times = torch.arange(1, int(steps) + 1, dtype=torch.float64) / int(steps)
+    curves = [decline_rate(index, times, {k: torch.tensor(v, dtype=torch.float64) for k, v in p.items()}) for p in params]
+    rows = []
+    for step in range(int(steps)):
+        for well, p in enumerate(params):
+            q = float(curves[well][step])
+            if noise:
+                q *= 1 + noise * rng.gauss(0.0, 1.0)
+            rows.append((float(times[step]), q, p["Di"], p["b"], p["Dinf"], p["n"], p["T"]))
+    return name, rows
+
+
+class DeclineParameters(nn.Module):
+    """The parameters of all five models for all wells, fitted during training.
+
+    The models have their own sets (``qi`` and their own constants, constant
+    over a well's history), so the models are compared at their own best fit
+    instead of competing for a shared ``Di``. Values stay inside FIT_RANGES:
+    ``low + (high - low) * sigmoid(raw)`` for b and n, ``low * (high / low) **
+    sigmoid(raw)`` for the others; raw 0 is the middle of the range.
+    """
+
+    def __init__(self, num_wells: int):
+        super().__init__()
+        self.names = [(m, key) for m, name in enumerate(DECLINE_MODELS) for key in FIT_RANGES[name]]
+        self.raw = nn.Parameter(torch.zeros(num_wells, len(self.names)))
+
+    def forward(self) -> list[dict[str, torch.Tensor]]:
+        """One dict per model, parameter name to a (num_wells,) tensor."""
+        out: list[dict[str, torch.Tensor]] = [{} for _ in DECLINE_MODELS]
+        for j, (m, key) in enumerate(self.names):
+            low, high = FIT_RANGES[DECLINE_MODELS[m]][key]
+            s = torch.sigmoid(self.raw[:, j])
+            out[m][key] = low + (high - low) * s if key in LINEAR_PARAMETERS else low * (high / low) ** s
+        return out
+
+
+class ModelSelector(nn.Module):
+    """The weights of the five residuals: a softmax over one learnt logit per model.
+
+    The weights are one distribution per run (one model generated the data),
+    start uniform, and are trained towards the model whose residual the data
+    let it zero (see train).
+    """
+
+    def __init__(self, num_models: int = len(DECLINE_MODELS)):
+        super().__init__()
+        self.logits = nn.Parameter(torch.zeros(num_models))
+
+    def forward(self) -> torch.Tensor:
+        return torch.softmax(self.logits, dim=0)
+
 
 def time_derivative(q: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
     """dq/dt element by element: ``out[s, b] = dq[s, b] / dt[s, b]``.
@@ -188,78 +329,42 @@ def time_derivative(q: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
 
 
 class PDEConstraints(nn.Module):
-    def __init__(self, num_pde_constraints: int):
+    """The five residuals: dq/dt minus the closed-form slopes of the five decline models.
+
+    Residual k vanishes along model k's curve with model k's parameters, and
+    stays above zero along the others' curves for any parameters in
+    FIT_RANGES (tests/test_residuals.py).
+    """
+
+    def __init__(self, num_pde_constraints: int = len(DECLINE_MODELS)):
         super().__init__()
-        self.num_pde_constraints = num_pde_constraints
-        # print(f"PDEConstraints initialized with {num_pde_constraints} constraints.")
-        if num_pde_constraints != 5:
-            print(f"Warning: Expected 5 PDE constraints for the given equations, but got {num_pde_constraints}.")
+        if num_pde_constraints != len(DECLINE_MODELS):
+            raise ValueError(f"PDEConstraints: there are {len(DECLINE_MODELS)} decline models, not {num_pde_constraints}")
 
-    def forward(self, model_output: torch.Tensor, input_data: torch.Tensor) -> torch.Tensor:
-        # model_output: (seq_len, batch_size, output_dim=6) where output_dim is q, Di, b, Dinf, n, T
-        # input_data: (seq_len, batch_size, input_dim=1) which is 't': the
-        # tensor the model's query stream consumed, with requires_grad.
+    def forward(self, dq_dt: torch.Tensor, t: torch.Tensor, params: list) -> torch.Tensor:
+        # dq_dt, t: (seq_len, batch_size); params: one dict per model of
+        # (batch_size,) tensors, as DeclineParameters returns them.
+        _require_same_shape("dq/dt", dq_dt, "t", t)
+        return torch.stack(
+            [dq_dt - decline_slope(k, t, params[k]) for k in range(len(DECLINE_MODELS))], dim=-1
+        )
 
-        seq_len, batch_size, output_dims = model_output.shape
-        if input_data.shape[-1] != 1 or output_dims != 6:
-            raise ValueError(f"Expected input_data (t) to have last dim 1 and model_output to have last dim 6. Got input {input_data.shape} and output {model_output.shape}")
 
-        # Extract t, q, Di, b, Dinf, n, T
-        t = input_data[:, :, 0]  # (seq_len, batch_size)
-        q = model_output[:, :, 0] # (seq_len, batch_size)
-        Di = model_output[:, :, 1] # (seq_len, batch_size)
-        b = model_output[:, :, 2] # (seq_len, batch_size)
-        Dinf = model_output[:, :, 3] # (seq_len, batch_size)
-        n = model_output[:, :, 4] # (seq_len, batch_size)
-        T = model_output[:, :, 5] # (seq_len, batch_size)
+def residual_errors(residuals: torch.Tensor, mask: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Mean squares of the residuals over the masked steps, divided by ``scale``: shape (5,)."""
+    weight = mask.unsqueeze(-1)
+    return (residuals.pow(2) * weight).sum(dim=(0, 1)) / weight.sum().clamp_min(1) / scale
 
-        # dq[s, b]/dt[s, b], differentiated with respect to the tensor the
-        # model read (a slice such as t above is a new node q never saw).
-        dq_dt = time_derivative(q, input_data)
 
-        # Extract qi (initial flow rate) - q at t=0. This will have shape (batch_size,)
-        # It's extracted from the first element in the sequence for each batch.
-        qi = q[0, :]
+def decline_misfits(t: torch.Tensor, rates: torch.Tensor, params: list, mask: torch.Tensor) -> torch.Tensor:
+    """Mean squared errors of the models' closed-form curves against the rates, over the masked steps: shape (5,).
 
-        # Expand qi to match (seq_len, batch_size) for element-wise operations with t and Di
-        qi_expanded = qi.unsqueeze(0).expand(seq_len, batch_size) # (seq_len, batch_size)
+    The curves are the integrals of the residuals' equations, so a model
+    whose residual the data can zero also matches them here, and only it.
+    """
+    errors = [((decline_rate(k, t, params[k]) - rates).pow(2) * mask).sum() for k in range(len(DECLINE_MODELS))]
+    return torch.stack(errors) / mask.sum().clamp_min(1)
 
-        # Powers of t with a negative exponent (pde_4, pde_5) are infinite at
-        # t = 0, the first step of a decline; they read t from 1e-6.
-        t_stable = torch.max(t, torch.tensor(1e-6))
-
-        # pde_1, exponential, q = qi * exp(-Di * t):
-        # dq_dt + Di * qi * exp( -Di * t) = 0
-        pde1_residual = dq_dt + Di * qi_expanded * torch.exp(-Di * t)
-
-        # pde_2, harmonic, q = qi / (1 + Di * t):
-        # dq_dt + [(Di * qi) / (1 + Di * t)^2] = 0
-        pde2_residual = dq_dt + (Di * qi_expanded) / (1 + Di * t) ** 2
-
-        # pde_3, hyperbolic, q = qi * (1 + b * Di * t)^(-1/b):
-        # dq_dt + [(Di * qi) / (1 + b * Di * t)^(1/b + 1)] = 0
-        pde3_base = (1 + b * Di * t)
-        pde3_exponent = (1 / b + 1)
-        pde3_residual = dq_dt + (Di * qi_expanded) / torch.pow(torch.max(pde3_base, torch.tensor(1e-6)), pde3_exponent)
-
-        # pde_4, Weibull, q = qi * exp(-(t/T)^n):
-        # dq_dt + (n * qi / T) * (t/T)^(n-1) * exp(-(t/T)^n) = 0
-        T_stable = torch.max(T, torch.tensor(1e-6))
-        t_div_T = t_stable / T_stable
-        pde4_residual = dq_dt + (n * qi_expanded / T_stable) * torch.pow(t_div_T, n - 1) * torch.exp(-torch.pow(t_div_T, n))
-
-        # pde_5, q = qi * exp((Di/(1-n)) * (t^(1-n) - 1) - Dinf * t), a model in
-        # which qi scales the rate at t = 1; like the others, the residual
-        # takes qi from the first step:
-        # dq_dt - qi * ((Di * t^(-n)) - Dinf) * exp((D/(1-n)) * (t^(1-n) - 1) - Dinf * t)
-        pde5_term1 = (Di * torch.pow(t_stable, -n)) - Dinf
-        pde5_term2_exponent = (Di / torch.max(torch.tensor(1e-6), (1 - n))) * (torch.pow(t_stable, (1 - n)) - 1) - Dinf * t
-        pde5_residual = dq_dt - qi * pde5_term1 * torch.exp(pde5_term2_exponent)
-
-        # Stack residuals to get (seq_len, batch_size, num_pde_constraints)
-        pde_residuals = torch.stack([pde1_residual, pde2_residual, pde3_residual, pde4_residual, pde5_residual], dim=-1)
-
-        return pde_residuals
 
 def _require_same_shape(name_a: str, a: torch.Tensor, name_b: str, b: torch.Tensor) -> None:
     """Refuse an element-wise comparison that would broadcast instead of match."""
@@ -270,47 +375,35 @@ def _require_same_shape(name_a: str, a: torch.Tensor, name_b: str, b: torch.Tens
 
 
 class PINNLoss(nn.Module):
+    """The reported loss: the rate's mean squared error plus the weighted residual errors."""
+
     def __init__(self, lambda_data: float = 1.0, lambda_pde: float = 1.0):
         super().__init__()
         self.lambda_data = lambda_data
         self.lambda_pde = lambda_pde
         self.mse_loss = nn.MSELoss()
 
-    def forward(self, predicted_y: torch.Tensor, true_y: torch.Tensor, predicted_weights: torch.Tensor, pde_residuals: torch.Tensor) -> torch.Tensor:
-        # predicted_y, true_y: (seq_len, batch_size, 6) with (q, Di, b, Dinf, n, T)
-        # in the last dimension. predicted_weights, pde_residuals:
-        # (seq_len, batch_size, num_pde_constraints).
+    def forward(self, predicted_q: torch.Tensor, observed_q: torch.Tensor, weights: torch.Tensor, errors: torch.Tensor) -> torch.Tensor:
+        # predicted_q, observed_q: (seq_len, batch_size) rates; weights, errors:
+        # (5,), one per decline model.
+        _require_same_shape("predicted q", predicted_q, "observed q", observed_q)
+        _require_same_shape("model weights", weights, "residual errors", errors)
+        data_loss = self.mse_loss(predicted_q, observed_q)
+        pde_loss = (weights * errors).sum()
+        return self.lambda_data * data_loss + self.lambda_pde * pde_loss
 
-        # 1. Data loss: the predicted rate against the observed rate, column 0
-        # of both. The decline parameters are learnt through the residuals.
-        q_pred = predicted_y[..., 0:1]
-        q_true = true_y[..., 0:1]
-        _require_same_shape("predicted q", q_pred, "observed q", q_true)
-        data_loss = self.mse_loss(q_pred, q_true)
-
-        # 2. Calculate PDE loss
-        _require_same_shape("adaptive weights", predicted_weights, "PDE residuals", pde_residuals)
-        # Square the PDE residuals
-        squared_pde_residuals = pde_residuals.pow(2)
-
-        # Element-wise multiplication with predicted_weights
-        weighted_pde_loss_terms = predicted_weights * squared_pde_residuals
-
-        # Sum across the num_pde_constraints dimension first, then average over seq_len and batch_size
-        pde_loss = torch.mean(torch.sum(weighted_pde_loss_terms, dim=-1))
-
-        # 3. Combine data loss and adaptively weighted PDE loss
-        total_loss = self.lambda_data * data_loss + self.lambda_pde * pde_loss
-
-        return total_loss
 
 class PINNTransformer(nn.Module):
-    def __init__(self, input_dim: int, output_dim: int, num_layers: int, d_model: int,
-                 num_heads: int, dim_feedforward: int, num_pde_constraints: int, dropout: float = 0.1, max_len: int = 5000):
+    """The rate network: q at query times, well by well, from the observed times."""
+
+    def __init__(self, input_dim: int, num_layers: int, d_model: int, num_heads: int,
+                 dim_feedforward: int, num_wells: int = 1, dropout: float = 0.1, max_len: int = 5000):
         super().__init__()
 
-        # 2a. Embedding layer for input features
+        # 2a. Embedding layer for input features, plus a learnt code per well:
+        # the wells share their times, and the code tells their curves apart.
         self.embedding = nn.Linear(input_dim, d_model)
+        self.well_codes = nn.Embedding(num_wells, d_model)
 
         # 2b. Transformer Encoder
         self.transformer_encoder = TransformerEncoder(
@@ -322,56 +415,40 @@ class PINNTransformer(nn.Module):
             max_len=max_len
         )
 
-        # 2c. Linear layer for predicting sequential output y
-        self.output_head = nn.Linear(d_model, output_dim)
+        # 2c. Linear layer for predicting the rate q
+        self.output_head = nn.Linear(d_model, 1)
 
-        # 2d. Self-Adaptive Weight Prediction Head
-        self.weight_head = SelfAdaptiveWeightPredictionHead(d_model, num_pde_constraints)
+    def forward(self, x: torch.Tensor, mask: torch.Tensor = None, context: torch.Tensor = None) -> torch.Tensor:
+        """Predict the rate at the times ``x``: shape (seq_len, batch_size, 1).
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor = None, context: torch.Tensor = None) -> tuple[torch.Tensor, torch.Tensor]:
-        """Predict the six outputs and the adaptive weights at the times ``x``.
-
-        x: (seq_len, batch_size, input_dim). Without ``context`` the positions
-        of ``x`` attend to each other, so the prediction at one time depends
-        on all the times of its sequence.
-
-        With ``context`` (the observed times, same shape), ``x`` holds query
-        times: position ``s`` of ``x`` attends to the context's keys and
-        values, so the outputs at ``s`` depend on ``x`` only through
-        ``x[s]``. Passing the observed times as both gives the same values as
-        ``model(x)``, and the gradient with respect to ``x`` is then the slope
-        of the predicted decline at the query times with the observations held
-        fixed: one backward pass (``time_derivative``) instead of one per time.
+        x: (seq_len, batch_size, input_dim), one column per well. With
+        ``context`` (the observed times, same shape), ``x`` holds query times:
+        position ``s`` of ``x`` attends to the context's keys and values and
+        carries no positional encoding, so the rate at ``s`` depends on ``x``
+        only through ``x[s]``. The gradient with respect to ``x`` is then the
+        slope of the predicted decline at the query times, with the
+        observations held fixed: one backward pass (``time_derivative``)
+        instead of one per time.
         """
-
-        # 3b. Pass input x through the initial embedding layer
-        embedded_x = self.embedding(x)
-        embedded_context = None if context is None else self.embedding(context)
-
-        # 3c. Pass the embedded input through the TransformerEncoder
+        codes = self.well_codes(torch.arange(x.size(1), device=x.device))
+        embedded_x = self.embedding(x) + codes
+        embedded_context = None if context is None else self.embedding(context) + codes
         encoder_output = self.transformer_encoder(embedded_x, mask, context=embedded_context)
-
-        # 3d. Use the encoder_output to predict the sequential output y
-        predicted_y_raw = self.output_head(encoder_output)
-
-        # Apply clamping or activation functions to predicted_y_raw components
-        q_pred = predicted_y_raw[:, :, 0:1]
-        Di_pred = torch.clamp(predicted_y_raw[:, :, 1:2], min=1e-6)
-        b_pred = torch.clamp(predicted_y_raw[:, :, 2:3], min=1e-6, max=1.0 - 1e-6)
-        Dinf_pred = torch.clamp(predicted_y_raw[:, :, 3:4], min=1e-6)
-        n_pred = torch.clamp(predicted_y_raw[:, :, 4:5], min=1e-6, max=1.0 - 1e-6)
-        T_pred = torch.clamp(predicted_y_raw[:, :, 5:6], min=1e-6)
-
-        predicted_y = torch.cat([q_pred, Di_pred, b_pred, Dinf_pred, n_pred, T_pred], dim=-1)
-
-        # 3e. Use the encoder_output to predict the adaptive_weights
-        adaptive_weights = self.weight_head(encoder_output)
-
-        # 3f. Return both predicted_y and adaptive_weights
-        return predicted_y, adaptive_weights
+        return self.output_head(encoder_output)
 
 
 from perd_worker import workflow, WorkflowStreamInput, WorkflowStreamOutput
+
+#: Learning rates of the decline parameters and of the model logits; the
+#: rate network uses train's learning_rate.
+PARAMETER_LEARNING_RATE = 0.05
+SELECTOR_LEARNING_RATE = 0.1
+#: Adam steps of the decline parameters per epoch: the closed-form fits are
+#: cheap next to the network, and converge in a few hundred steps.
+DECLINE_FIT_STEPS = 5
+#: Share of the epochs during which the weights stay uniform while all
+#: models fit their parameters, before the logits start to learn.
+WARMUP_SHARE = 1 / 3
 
 
 @workflow.bi_di
@@ -390,34 +467,44 @@ async def train(
     lambda_data: float = 1.0,
     lambda_pde: float = 1.0,
     report_every: int = 10,
-) -> WorkflowStreamOutput[int, float]:
-    """Train the PINN Transformer on a stream of decline-curve samples.
+) -> WorkflowStreamOutput[int, float, str, float, float, float, float, float]:
+    """Train the PINN on decline curves and identify the decline model behind them.
 
     Stream in one item per time step: ``(t, q, Di, b, Dinf, n, T)``, the
-    time, the observed rate and the five DCA parameters. The data loss
-    compares the predicted rate with ``q``; the network infers the five
-    parameters through the physics residuals, so their columns are read but
-    not compared with anything. Items are consumed in order and interleaved
-    into ``batch_size`` sequences: item ``i`` is time step ``i // batch_size``
-    of sequence ``i % batch_size``. The physics residuals take the rate at
-    the first step of a sequence as its initial rate ``qi``, so sequences
-    should start at the beginning of the decline (``t = 0``).
+    time, the observed rate and the generating parameters
+    (``synthetic_declines`` writes them; train does not read them). Items
+    are interleaved into ``batch_size`` wells: item ``i`` is time step
+    ``i // batch_size`` of well ``i % batch_size``. Times and rates are
+    scaled by their largest values, so any units work.
 
-    Streams out ``(epoch, loss)`` on the first epoch and every
-    ``report_every`` epochs after that, so a client can plot the loss live.
+    The network fits the rates, and the parameters of all five decline
+    models (exponential, harmonic, hyperbolic, Weibull, power-law
+    exponential) are fitted well by well to its slope. A softmax over five
+    learnt logits weights the models' residuals: it stays uniform for the
+    first third of the epochs, then learns towards the model whose residual
+    is smallest relative to the others, ideally 1 for the generating model
+    and 0 for the rest.
+
+    Streams out ``(epoch, loss, model, w_exponential, w_harmonic,
+    w_hyperbolic, w_weibull, w_power_law_exponential)`` on the first epoch
+    and then once per ``report_every`` epochs: ``model`` is the name of the
+    model with the largest weight.
 
     Parameters
     ----------
     batch_size : int
-        Sequences per optimisation step (default 4).
+        Wells per run, interleaved in the stream (default 4).
     epochs : int
         Number of training epochs (default 100).
+    output_dim, num_pde_constraints : int
+        The stream's target columns (6) and the decline models (5); other
+        values are refused.
     learning_rate : float
-        Adam step size (default 0.001).
+        Adam step size of the rate network (default 0.001).
     lambda_data, lambda_pde : float
         Weights of the data-fit and physics-residual loss terms.
     report_every : int
-        Emit ``(epoch, loss)`` every this many epochs (default 10).
+        Epochs between two output items (default 10).
     """
 
     batch_size = int(batch_size)
@@ -455,53 +542,76 @@ async def train(
         )
     data_t = data_t[:usable].reshape(usable // batch_size, batch_size, 7)
 
-    input_dim = data_t.shape[-1] - output_dim  # Assuming last 6 columns are true_y (q, Di, b, Dinf, n, T)
-    X = data_t[:, :, :input_dim]
-    Y = data_t[:, :, input_dim:]
+    # Times in units of the longest time, rates in units of their well's
+    # largest rate.
+    times = data_t[:, :, :1] / data_t[:, :, 0].abs().max().clamp_min(1e-12)
+    rates = data_t[:, :, 1] / data_t[:, :, 1].abs().amax(dim=0).clamp_min(1e-12)
+    t = times[:, :, 0]
+    # The residuals skip t <= 0, where two of the models fall infinitely fast.
+    collocation = (t > 0).float()
 
-    # Model instantiation
     model = PINNTransformer(
-        input_dim=input_dim,
-        output_dim=output_dim,
+        input_dim=1,
         num_layers=num_layers,
         d_model=d_model,
         num_heads=num_heads,
         dim_feedforward=dim_feedforward,
-        num_pde_constraints=num_pde_constraints,
-        dropout=dropout
+        num_wells=batch_size,
+        dropout=dropout,
     )
-
-    pde_constraints_module = PDEConstraints(num_pde_constraints=num_pde_constraints)
+    decline_parameters = DeclineParameters(num_wells=batch_size)
+    selector = ModelSelector()
+    pde_constraints_module = PDEConstraints(num_pde_constraints)
     pinn_loss_fn = PINNLoss(lambda_data=lambda_data, lambda_pde=lambda_pde)
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    optimizer = torch.optim.Adam([
+        {"params": model.parameters(), "lr": learning_rate},
+        {"params": selector.parameters(), "lr": SELECTOR_LEARNING_RATE},
+    ])
+    fit_optimizer = torch.optim.Adam(decline_parameters.parameters(), lr=PARAMETER_LEARNING_RATE)
+    warmup = int(epochs * WARMUP_SHARE)
 
     print(f"Starting PINN training for {epochs} epochs...")
-    final_loss = 0.0
-    loss_history = [] 
-
     for epoch in range(epochs):
+        # 1. Fit all models' parameters to the rates, well by well, through
+        # its closed-form curve. All five fit unweighted, so a model the
+        # weights have not chosen yet still reaches its best fit.
+        for _ in range(DECLINE_FIT_STEPS):
+            fit_optimizer.zero_grad()
+            misfits = decline_misfits(t, rates, decline_parameters(), collocation)
+            misfits.sum().backward()
+            fit_optimizer.step()
+        params = [{key: value.detach() for key, value in p.items()} for p in decline_parameters()]
+        misfits = misfits.detach()
+
+        # 2. The network: the rates plus the residuals of the fitted models,
+        # weighted by the current weights.
         model.train()
         optimizer.zero_grad()
-
         # The observed times again, as a leaf that can carry dq/dt: the query
-        # stream reads it and the context stream reads X (same values).
-        t_query = X.clone().requires_grad_(True)
-        predicted_y, adaptive_weights = model(t_query, context=X)
-        pde_residuals = pde_constraints_module(predicted_y, t_query)
+        # stream reads it and the context stream reads `times` (same values).
+        t_query = times.clone().requires_grad_(True)
+        q = model(t_query, context=times)[:, :, 0]
+        dq_dt = time_derivative(q, t_query)
+        slope_scale = residual_errors(dq_dt.detach().unsqueeze(-1), collocation, torch.tensor(1.0))[0].clamp_min(1e-12)
+        errors = residual_errors(pde_constraints_module(dq_dt, t, params), collocation, slope_scale)
+        weights = selector()
+        total_loss = pinn_loss_fn(q, rates, weights.detach(), errors)
 
-        total_loss = pinn_loss_fn(
-            predicted_y=predicted_y,
-            true_y=Y,
-            predicted_weights=adaptive_weights,
-            pde_residuals=pde_residuals
-        )
+        # 3. The weights: after the warm-up, the logits learn towards the
+        # model that fits best. They read the logarithms of the misfits: the
+        # gradient then depends on misfit ratios, not on the errors' scale,
+        # and a model five times better than the runner-up wins as surely as
+        # one a hundred times better than the rest.
+        objective = total_loss
+        if epoch >= warmup:
+            objective = objective + (weights * torch.log(misfits.clamp_min(1e-12))).sum()
 
-        total_loss.backward()
+        objective.backward()
         optimizer.step()
 
-        final_loss = total_loss.item()
-        loss_history.append(final_loss)
-        
         if (epoch + 1) % max(int(report_every), 1) == 0 or epoch == 0:
-            print(f"Epoch [{epoch+1}/{epochs}], Loss: {final_loss:.4f}")
-            yield epoch + 1, final_loss
+            final_weights = selector().detach()
+            loss = total_loss.item()
+            chosen = DECLINE_MODELS[int(final_weights.argmax())]
+            print(f"Epoch [{epoch+1}/{epochs}], Loss: {loss:.4f}, model: {chosen}")
+            yield (epoch + 1, loss, chosen, *[float(w) for w in final_weights])

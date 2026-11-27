@@ -88,7 +88,7 @@ def test_train_keeps_its_published_interface():
     op = workflow.workflow.ops["train"]
     assert op.mode == "bi_di"
     assert op.input_item_types == (float,) * 7
-    assert op.output_item_types == (int, float)
+    assert op.output_item_types == (int, float, str) + (float,) * 5
     assert [(name, kind, default) for name, kind, _, default in op.params] == TRAIN_PARAMS
 
 
