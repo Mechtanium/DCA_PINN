@@ -224,24 +224,34 @@ class PDEConstraints(nn.Module):
         # Expand qi to match (seq_len, batch_size) for element-wise operations with t and Di
         qi_expanded = qi.unsqueeze(0).expand(seq_len, batch_size) # (seq_len, batch_size)
 
-        # pde_1: dq_dt + Di * qi * exp( -Di * t) = 0
+        # Powers of t with a negative exponent (pde_4, pde_5) are infinite at
+        # t = 0, the first step of a decline; they read t from 1e-6.
+        t_stable = torch.max(t, torch.tensor(1e-6))
+
+        # pde_1, exponential, q = qi * exp(-Di * t):
+        # dq_dt + Di * qi * exp( -Di * t) = 0
         pde1_residual = dq_dt + Di * qi_expanded * torch.exp(-Di * t)
 
-        # pde_2: dq_dt + [(Di * qi) / (1 + Di * t)] = 0
-        pde2_residual = dq_dt + (Di * qi_expanded) / (1 + Di * t)
+        # pde_2, harmonic, q = qi / (1 + Di * t):
+        # dq_dt + [(Di * qi) / (1 + Di * t)^2] = 0
+        pde2_residual = dq_dt + (Di * qi_expanded) / (1 + Di * t) ** 2
 
-        # pde_3: dq_dt + [(Di * qi) / (1 + b * Di * t)^(1/b - 1)] = 0
+        # pde_3, hyperbolic, q = qi * (1 + b * Di * t)^(-1/b):
+        # dq_dt + [(Di * qi) / (1 + b * Di * t)^(1/b + 1)] = 0
         pde3_base = (1 + b * Di * t)
-        pde3_exponent = (1 / b - 1)
+        pde3_exponent = (1 / b + 1)
         pde3_residual = dq_dt + (Di * qi_expanded) / torch.pow(torch.max(pde3_base, torch.tensor(1e-6)), pde3_exponent)
 
-        # pde_4: dq_dt + (n * qi / T) * (t/T)^(n-1) * exp(-(t/T)^n)
+        # pde_4, Weibull, q = qi * exp(-(t/T)^n):
+        # dq_dt + (n * qi / T) * (t/T)^(n-1) * exp(-(t/T)^n) = 0
         T_stable = torch.max(T, torch.tensor(1e-6))
-        t_div_T = t / T_stable
+        t_div_T = t_stable / T_stable
         pde4_residual = dq_dt + (n * qi_expanded / T_stable) * torch.pow(t_div_T, n - 1) * torch.exp(-torch.pow(t_div_T, n))
 
-        # pde_5: dq_dt - qi * ((Di * t^(-n)) - Dinf) * exp((D/(1-n)) * (t^(1-n) - 1) - Dinf * t)
-        t_stable = torch.max(t, torch.tensor(1e-6))
+        # pde_5, q = qi * exp((Di/(1-n)) * (t^(1-n) - 1) - Dinf * t), a model in
+        # which qi scales the rate at t = 1; like the others, the residual
+        # takes qi from the first step:
+        # dq_dt - qi * ((Di * t^(-n)) - Dinf) * exp((D/(1-n)) * (t^(1-n) - 1) - Dinf * t)
         pde5_term1 = (Di * torch.pow(t_stable, -n)) - Dinf
         pde5_term2_exponent = (Di / torch.max(torch.tensor(1e-6), (1 - n))) * (torch.pow(t_stable, (1 - n)) - 1) - Dinf * t
         pde5_residual = dq_dt - qi * pde5_term1 * torch.exp(pde5_term2_exponent)
@@ -389,7 +399,9 @@ async def train(
     parameters through the physics residuals, so their columns are read but
     not compared with anything. Items are consumed in order and interleaved
     into ``batch_size`` sequences: item ``i`` is time step ``i // batch_size``
-    of sequence ``i % batch_size``.
+    of sequence ``i % batch_size``. The physics residuals take the rate at
+    the first step of a sequence as its initial rate ``qi``, so sequences
+    should start at the beginning of the decline (``t = 0``).
 
     Streams out ``(epoch, loss)`` on the first epoch and every
     ``report_every`` epochs after that, so a client can plot the loss live.
